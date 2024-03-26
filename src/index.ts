@@ -27,67 +27,56 @@ let swapConfig = {
   maxRetries: 20,
 };
 
-let tradePlaced = false; // <-- TEMPORARY FOR TESTING!!!
 
+// // Testing function for finding how poolInfo is normally formatted
+// async function fetchMarketAccounts(base, quote) {
+//   const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
+//   await raydiumSwap.loadPoolKeys('https://api.raydium.io/v2/sdk/liquidity/mainnet.json');
+//   const poolInfo = raydiumSwap.findPoolInfoForTokens(base, quote);
+//   console.log(poolInfo);
+//   return poolInfo;
+// }
 
-// ====================================
-// === Start of out-of-the-box code ===
-// ====================================
 
 // Performs a token swap on the Raydium protocol. Depending on the configuration, it can execute the swap or simulate it.
 const swap = async (poolInfo) => {
+  const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
+  console.log(`Swapping ${swapConfig.tokenAAmount} of ${swapConfig.tokenAAddress} for ${swapConfig.tokenBAddress}...`);
 
-  if (tradePlaced) { // <-- TEMPORARY FOR TESTING!!!
-    console.log("NOT PLACING TRADE, DUE TO TESTING");
+  // Prepare the swap transaction with the given parameters.
+  const tx = await raydiumSwap.getSwapTransaction(
+    swapConfig.tokenBAddress,
+    swapConfig.tokenAAmount,
+    poolInfo,
+    swapConfig.maxLamports,
+    swapConfig.useVersionedTransaction,
+    swapConfig.direction
+  );
+
+  const simRes = swapConfig.useVersionedTransaction
+    ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
+    : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
+  console.log(simRes);
+
+  // Depending on the configuration, execute or simulate the swap.
+  if (swapConfig.executeSwap) {
+    // Send the transaction to the network and log the transaction ID.
+    const txid = swapConfig.useVersionedTransaction
+      ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
+      : await raydiumSwap.sendLegacyTransaction(tx as Transaction, swapConfig.maxRetries);
+    console.log(`https://solscan.io/tx/${txid}`);
   } else {
-    tradePlaced = true;
-
+    // Simulate the transaction and log the result.
     const simRes = swapConfig.useVersionedTransaction
       ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
       : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
-
     console.log(simRes);
-
-    // The RaydiumSwap instance for handling swaps.
-    const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
-    console.log(`Raydium swap initialized`);
-    console.log(`Swapping ${swapConfig.tokenAAmount} of ${swapConfig.tokenAAddress} for ${swapConfig.tokenBAddress}...`)
-
-    // Prepare the swap transaction with the given parameters.
-    const tx = await raydiumSwap.getSwapTransaction(
-      swapConfig.tokenBAddress,
-      swapConfig.tokenAAmount,
-      poolInfo,
-      swapConfig.maxLamports,
-      swapConfig.useVersionedTransaction,
-      swapConfig.direction
-    );
-
-
-    // // Depending on the configuration, execute or simulate the swap.
-    if (swapConfig.executeSwap) {
-      // Send the transaction to the network and log the transaction ID.
-      const txid = swapConfig.useVersionedTransaction
-        ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
-        : await raydiumSwap.sendLegacyTransaction(tx as Transaction, swapConfig.maxRetries);
-      console.log(`https://solscan.io/tx/${txid}`);
-    } else {
-      // Simulate the transaction and log the result.
-      const simRes = swapConfig.useVersionedTransaction
-        ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
-        : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
-      console.log(simRes);
-    }
   }
 };
 
 
-// ==================================
-// === End of out-of-the-box code ===
-// ==================================
-
 // Helper function to get pool info
-async function getPoolData(idoAccountString) {
+async function getPoolData(idoAccount) {
   try {
     // const idoPoolInfo = await connection.getAccountInfo(new PublicKey(idoAccountString));
     // if (!idoPoolInfo) {
@@ -98,6 +87,7 @@ async function getPoolData(idoAccountString) {
     // console.log(idoPoolInfo);
     // return poolInfo;
 
+    const idoAccountString = idoAccount.toBase58();
     const response = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
       jsonrpc: '2.0',
       id: 1,
@@ -111,9 +101,15 @@ async function getPoolData(idoAccountString) {
       ],
     });
 
+    // The response returns a JSON of data in base64. We convert it into a Buffer of Uint8Array for the Raydium library to decode
     const binaryString = atob(response.data.result.value.data[0]);
     const uint8Array = Uint8Array.from(binaryString, (char) => char.charCodeAt(0));
-    const poolInfo = LIQUIDITY_STATE_LAYOUT_V4.decode(Buffer.from(uint8Array));
+    const poolInfo: any = LIQUIDITY_STATE_LAYOUT_V4.decode(Buffer.from(uint8Array));
+    poolInfo.id = idoAccount;
+    poolInfo.programId = new PublicKey(RAYDIUM_PUBLIC_KEY);
+    // poolInfo.lpVault = new PublicKey("11111111111111111111111111111111"); // this breaks things, leaving it commented out
+    poolInfo.version = 4; // MIGHT BREAK?!?
+    poolInfo.marketVersion = 4; // MIGHT BREAK?!?
     return poolInfo;
 
   } catch (error) {
@@ -176,7 +172,7 @@ async function main(connection, programAddress) {
         ({ logs, err, signature }) => {
             if (err) return;
 
-            if (!tradePlaced && logs && logs.some(log => log.includes("initialize2"))) { // <----- TEMPORARY CHECK FOR tradePlaced!!!!!! // <-- TEMPORARY FOR TESTING!!!
+            if (logs && logs.some(log => log.includes("initialize2"))) {
                 console.log("=== New LP Found ===");
                 fetchRaydiumAccounts(signature, connection);
             }
@@ -184,6 +180,7 @@ async function main(connection, programAddress) {
         "confirmed" // "processed" is faster but sometimes too fast and we throw the "account not found error below"
     );
 }
+
 
 // Parse transaction and filter data
 async function fetchRaydiumAccounts(txId, connection) {
@@ -217,8 +214,8 @@ async function fetchRaydiumAccounts(txId, connection) {
     console.log("Transaction: https://solscan.io/tx/" + txId);
     console.table(displayData);
 
-    // Get pool info from the IDO
-    const poolInfo = await getPoolData(raydiumIdoIdAccount.toBase58());
+    // Get pool info from the IDO, and add some data points from the new LP listing transaction
+    const poolInfo = await getPoolData(raydiumIdoIdAccount);
 
     // Continue if a SOL pair... FOR SIMPLICITY'S SAKE, ONLY TRADING PAIRS WHERE SOL IS THE TOKEN-A
     if (tokenAAccount == "So11111111111111111111111111111111111111112") {
@@ -266,75 +263,75 @@ async function fetchRaydiumAccounts(txId, connection) {
 
 main(connection, raydium).catch(console.error);
 
-
-
+// fetchMarketAccounts("So11111111111111111111111111111111111111112", "3WMr8ncjho5hy3RBL4ZXydTjZcGSi7YxYLHLhq1zKP1F");
+// testing with https://solscan.io/tx/yRdAehjqcaRB5LrfSKQFF3vrKWeCGviYFiTmw56PAzY2zKoAwYwXLVBpXvQBenX9bKsSYvWz4teMqxgxZbLwaqV (token: 3WMr8ncjho5hy3RBL4ZXydTjZcGSi7YxYLHLhq1zKP1F)
 
 
 //
 // {
-//   id: PublicKey [PublicKey(BYEFi2Bquys5FT91XriudrH2kqZx2gYaUEQ6ypUogJQ4)] {
+// y  id: PublicKey [PublicKey(BYEFi2Bquys5FT91XriudrH2kqZx2gYaUEQ6ypUogJQ4)] {
 //     _bn: <BN: 9c94dc369606dc3098ff9ef8e04ef436dbcf64b2210aea908cf3f700470a6a35>
 //   },
-//   baseMint: PublicKey [PublicKey(HKgonhHkRSCtQWzCtQgFNsu8TEcf3oWau8xH87Si3LuB)] {
+// y  baseMint: PublicKey [PublicKey(HKgonhHkRSCtQWzCtQgFNsu8TEcf3oWau8xH87Si3LuB)] {
 //     _bn: <BN: f28474778f1f194ca52583b762ac1f60f66cc949b956a5f9a0539e9143970efe>
 //   },
-//   quoteMint: PublicKey [PublicKey(So11111111111111111111111111111111111111112)] {
+// y  quoteMint: PublicKey [PublicKey(So11111111111111111111111111111111111111112)] {
 //     _bn: <BN: 69b8857feab8184fb687f634618c035dac439dc1aeb3b5598a0f00000000001>
 //   },
-//   lpMint: PublicKey [PublicKey(GhqWe5ZgZAZv6SpB5ajzsf6Xs8yWKzbd1v6TC6XnJVDX)] {
+// y  lpMint: PublicKey [PublicKey(GhqWe5ZgZAZv6SpB5ajzsf6Xs8yWKzbd1v6TC6XnJVDX)] {
 //     _bn: <BN: e9556349df6bb7ccfeacfdf3efe911e8e8bb2fba58bba75ce72c07f9503c46be>
 //   },
-//   baseDecimals: 6,
-//   quoteDecimals: 9,
-//   lpDecimals: 6,
-//   version: 4,
-//   programId: PublicKey [PublicKey(675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8)] {
+// n  baseDecimals: 6,
+// n  quoteDecimals: 9,
+// n  lpDecimals: 6,
+// y  version: 4,
+// y  programId: PublicKey [PublicKey(675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8)] {
 //     _bn: <BN: 4bd949c43602c33f207790ed16a3524ca1b9975cf121a2a90cffec7df8b68acd>
 //   },
-//   authority: PublicKey [PublicKey(5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1)] {
+// n  authority: PublicKey [PublicKey(5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1)] {
 //     _bn: <BN: 4157b0580f31c5fce44a62582dbcf9d78ee75943a084a393b350368d22899308>
 //   },
-//   openOrders: PublicKey [PublicKey(BVAZAZSnsxaYFWRKrQ2BuGUJxmk7boG1bYVqYw3N5gsq)] {
+// y  openOrders: PublicKey [PublicKey(BVAZAZSnsxaYFWRKrQ2BuGUJxmk7boG1bYVqYw3N5gsq)] {
 //     _bn: <BN: 9bcbef6fcbeb0f594487fbd0c94ccae4879924df08018f0c1d39ec895d63dd30>
 //   },
-//   targetOrders: PublicKey [PublicKey(42BtD4tph5pKkwWYAeHTEaxYiLNWBZQaTozC6MBb1uP4)] {
+// y  targetOrders: PublicKey [PublicKey(42BtD4tph5pKkwWYAeHTEaxYiLNWBZQaTozC6MBb1uP4)] {
 //     _bn: <BN: 2ce0f26951bda6ddc58b536723f1e33960090f0cac905d954472949527c4232f>
 //   },
-//   baseVault: PublicKey [PublicKey(FiGHbjwnhjcCYcF2a4KngLaRj8zw9sTV7SVUMdzWAWPw)] {
+// y  baseVault: PublicKey [PublicKey(FiGHbjwnhjcCYcF2a4KngLaRj8zw9sTV7SVUMdzWAWPw)] {
 //     _bn: <BN: da95b6dbb969a0cc471c9a13caefe1361328fd5940634e5342322cbfefc0531e>
 //   },
-//   quoteVault: PublicKey [PublicKey(DVpoas1ibW9omBq7DvzWApDaeVz5nF59985kkeVDtKdq)] {
+// y  quoteVault: PublicKey [PublicKey(DVpoas1ibW9omBq7DvzWApDaeVz5nF59985kkeVDtKdq)] {
 //     _bn: <BN: b9ae8e96a9a3d5261c17ca1d64e25cddb084ae8709cdb071097ad0bec0319ed8>
 //   },
-//   withdrawQueue: PublicKey [PublicKey(11111111111111111111111111111111)] {
+// y  withdrawQueue: PublicKey [PublicKey(11111111111111111111111111111111)] {
 //     _bn: <BN: 0>
 //   },
-//   lpVault: PublicKey [PublicKey(11111111111111111111111111111111)] {
+// n  lpVault: PublicKey [PublicKey(11111111111111111111111111111111)] {
 //     _bn: <BN: 0>
 //   },
-//   marketVersion: 4,
-//   marketProgramId: PublicKey [PublicKey(srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX)] {
+// y  marketVersion: 4,
+// y  marketProgramId: PublicKey [PublicKey(srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX)] {
 //     _bn: <BN: d0751a8282da61305fe299c37b998e58471db1135037310f8be1045a60af6ee>
 //   },
-//   marketId: PublicKey [PublicKey(HxMEbmzdy3rUwvJH42b2NR8wqH7xyWy73zz26Tgwy1FK)] {
+// y  marketId: PublicKey [PublicKey(HxMEbmzdy3rUwvJH42b2NR8wqH7xyWy73zz26Tgwy1FK)] {
 //     _bn: <BN: fbe8d08411a1b4b8396f9fc7edd2201ee0afe04747d4b9ebeb6299f19c34debe>
 //   },
-//   marketAuthority: PublicKey [PublicKey(2cxQ4FqfQR7jvFDFMEAJMaGqawRU7gTRZfXtiSRRra6a)] {
+// n  marketAuthority: PublicKey [PublicKey(2cxQ4FqfQR7jvFDFMEAJMaGqawRU7gTRZfXtiSRRra6a)] {
 //     _bn: <BN: 1811a746789c6649f684d5887ddde8e7238e23e6a963a6bc6b28b3c594ef16cf>
 //   },
-//   marketBaseVault: PublicKey [PublicKey(4XX8AwAn9NReRfBipoebxCBt8jXwuMy7ufjneP7qfhPy)] {
+// n  marketBaseVault: PublicKey [PublicKey(4XX8AwAn9NReRfBipoebxCBt8jXwuMy7ufjneP7qfhPy)] {
 //     _bn: <BN: 34648bc43586be81057ef2963305b960fe2cb729b57103c95fd12e62e58e0084>
 //   },
-//   marketQuoteVault: PublicKey [PublicKey(FnpvRnkKznjeqzsuV9ceCNA5aSddN3b4fgNbu8R5SgfB)] {
+// n  marketQuoteVault: PublicKey [PublicKey(FnpvRnkKznjeqzsuV9ceCNA5aSddN3b4fgNbu8R5SgfB)] {
 //     _bn: <BN: dbc0f0214853141530b43268abde77cb5d346ba6048dbedd3f5f137d7324a00a>
 //   },
-//   marketBids: PublicKey [PublicKey(7xudwbqcW6oA2iBomv6X2zvxQ35215LsmAhEgJ6ckzgQ)] {
+// n  marketBids: PublicKey [PublicKey(7xudwbqcW6oA2iBomv6X2zvxQ35215LsmAhEgJ6ckzgQ)] {
 //     _bn: <BN: 677895333c043cbb71853c4c4ccc07b3f61496b7f91336185c0067836e0c14b9>
 //   },
-//   marketAsks: PublicKey [PublicKey(5WzzPFZqDqafnc3XFsF9xJv6mLok4FPJRbAa9cR6NaHT)] {
+// n  marketAsks: PublicKey [PublicKey(5WzzPFZqDqafnc3XFsF9xJv6mLok4FPJRbAa9cR6NaHT)] {
 //     _bn: <BN: 431e28f3419e20fa5f686fdb10ef47e072e3894b9e43961b13df301df65194b6>
 //   },
-//   marketEventQueue: PublicKey [PublicKey(D5U7nM5nMWTgBFANKSLhgnBUh6qgaw2Ux391vmSNjLgK)] {
+// n  marketEventQueue: PublicKey [PublicKey(D5U7nM5nMWTgBFANKSLhgnBUh6qgaw2Ux391vmSNjLgK)] {
 //     _bn: <BN: b3713a416ebb746635df35388a24d898dc20fc533b395ae14488a1eeb1aa5b94>
 //   }
 // }

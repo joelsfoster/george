@@ -40,7 +40,7 @@ class RaydiumSwap {
    */
   async loadPoolKeys(liquidityFile: string) {
     const liquidityJsonResp = await fetch(liquidityFile);
-    if (!liquidityJsonResp.ok) return
+    if (!liquidityJsonResp.ok) return console.log("ERROR GETTING LIQUIDITY FILE")
     const liquidityJson = (await liquidityJsonResp.json()) as { official: any; unOfficial: any }
     const allPoolKeysJson = [...(liquidityJson?.official ?? []), ...(liquidityJson?.unOfficial ?? [])]
 
@@ -102,7 +102,7 @@ class RaydiumSwap {
   ): Promise<Transaction | VersionedTransaction> {
     const directionIn = poolKeys.quoteMint.toString() == toToken
     const { minAmountOut, amountIn } = await this.calcAmountOut(poolKeys, amount, directionIn)
-    // console.log({ minAmountOut, amountIn });
+    console.log({ minAmountOut, amountIn });
     const userTokenAccounts = await this.getOwnerTokenAccounts()
     const swapTransaction = await Liquidity.makeSwapInstructionSimple({
       connection: this.connection,

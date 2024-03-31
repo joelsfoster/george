@@ -52,8 +52,27 @@ let startingSolBalance;
 // }
 
 
+async function checkSolBalance() {
+  try {
+    const response = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getBalance',
+      params: [
+        new PublicKey(MY_WALLET)
+      ],
+    });
+
+    const balance = response.data.result.value / LAMPORTS_PER_SOL;
+    return balance;
+
+  } catch (error) {
+    throw new Error(`checkSolBalance Error: ${error}`);
+  }
+}
+
 // Helper function to see my balance of a token
-async function checkWalletBalance(tokenMintAddress){
+async function checkWalletBalance(tokenMintAddress) {
   try {
     const response = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
       jsonrpc: '2.0',
@@ -258,17 +277,16 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
     } catch (error) {
       if (buyOrSell == "sell") {
         console.log("Success: Insufficient funds error, everything sold!");
-        const newSolBalance = await checkWalletBalance(swapConfig.tokenAAddress);
+        const newSolBalance = await checkSolBalance();
         const solTradeResult = newSolBalance - startingSolBalance;
         console.log("!!! TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL!!!");
-        console.log("!!! CONTINUING TRADING... !!!");        
+        console.log("!!! CONTINUING TRADING... !!!");
         tradeInProgress = false;
         return;
       } else { // If a transaction attempt fails with a "buy", it is likely because the pool didn't launch yet, so we continue onward with our attempts
         myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
         swapConfig.tokenBAmount = myTokenBalance;
-        if (myTokenBalance > 0) {
-          console.log("!!! ERROR: SOMETHING FUNKY HAPPENED, SELLING JUST IN CASE !!!");
+        if (myTokenBalance > 0) { // ...unless we see tokens in our account, in which case it doesn't really matter and we should try to sell
           return await swap(poolInfo, "sell", listingTime);
         }
       }
@@ -301,7 +319,7 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
           await swap(poolInfo, "sell", listingTime);
         }, 30000);
       } else { // Sell successful! Log SOL amount and continue trading
-        const newSolBalance = await checkWalletBalance(swapConfig.tokenAAddress);
+        const newSolBalance = await checkSolBalance();
         const solTradeResult = newSolBalance - startingSolBalance;
         console.log("!!! TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL!!!");
         console.log("!!! CONTINUING TRADING... !!!");
@@ -410,7 +428,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
         tradeInProgress = true;
         swapConfig.direction = 'in';
         swapConfig.maxLamports = SLOW_PRIORITY_FEE * 1000000000; // Slow for spamming
-        startingSolBalance = await checkWalletBalance(swapConfig.tokenAAddress);
+        startingSolBalance = await checkSolBalance();
         swap(poolInfo, "buy", listingTime);
       } else {
         console.log("~~~NOT SAFE, NOT TRADING~~~");

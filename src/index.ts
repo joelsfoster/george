@@ -258,6 +258,10 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
     } catch (error) {
       if (buyOrSell == "sell") {
         console.log("Success: Insufficient funds error, everything sold!");
+        const newSolBalance = await checkWalletBalance(swapConfig.tokenAAddress);
+        const solTradeResult = newSolBalance - startingSolBalance;
+        console.log("!!! TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL!!!");
+        console.log("!!! CONTINUING TRADING... !!!");        
         tradeInProgress = false;
         return;
       } else { // If a transaction attempt fails with a "buy", it is likely because the pool didn't launch yet, so we continue onward with our attempts

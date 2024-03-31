@@ -18,20 +18,26 @@ const connection = new Connection(`https://frosty-little-smoke.solana-mainnet.qu
 // ===== GLOBAL VARIABLES =====
 // ============================
 
+const SLOW_PRIORITY_FEE = .0001; // 0.000008333 // 0.000012173
+const FAST_PRIORITY_FEE = .0008; // 0.000008333 // 0.000012173
+
+const MY_WALLET = "HDaBHzbsGnUS8tS9cPRsMZ5wEKWR12gZWsiK5XfgdFYD";
+
 let swapConfig = {
   executeSwap: true, // Send tx when true, simulate tx when false
   useVersionedTransaction: true,
-  tokenAAmount: 0.001, // Swap 0.01 SOL for USDT in this example
+  tokenAAmount: 0.001, // Swap 0.01 SOL for USDC in this example
+  tokenBAmount: 0,
   tokenAAddress: "So11111111111111111111111111111111111111112", // Token to swap for the other, SOL in this case
-  tokenBAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC address
-  maxLamports: 1000000, // Micro lamports for priority fee
+  tokenBAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC address
+  maxLamports: SLOW_PRIORITY_FEE * 1000000000, // Micro lamports for priority fee
   direction: "in" as "in" | "out", // Swap direction: 'in' or 'out'
   liquidityFile: "https://api.raydium.io/v2/sdk/liquidity/mainnet.json",
   maxRetries: 20,
 };
 
-let tradeMade = false;
-
+let tradeInProgress = false; // prevents concurrent trade sequences, forces 1 token to be traded at a time
+let startingSolBalance;
 
 // ============================
 // ===== HELPER FUNCTIONS =====
@@ -46,6 +52,37 @@ let tradeMade = false;
 // }
 
 
+// Helper function to see my balance of a token
+async function checkWalletBalance(tokenMintAddress){
+  try {
+    const response = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTokenAccountsByOwner',
+      params: [
+        new PublicKey(MY_WALLET),
+        {
+          "mint": tokenMintAddress,
+        },
+        {
+          "encoding": "jsonParsed",
+          "commitment": "processed",
+        },
+      ],
+    });
+
+    if (response.data.result.value.length > 0) {
+      return response.data.result.value[0].account.data.parsed.info.tokenAmount.uiAmount;
+    } else {
+      return 0;
+    }
+
+  } catch (error) {
+    throw new Error(`checkWalletBalance Error: ${error}`);
+  }
+}
+
+
 // Helper function to get top token holders
 async function getTokenBalances(tokenProgramAddress, tokenMintAddress) {
   try {
@@ -57,6 +94,7 @@ async function getTokenBalances(tokenProgramAddress, tokenMintAddress) {
         tokenProgramAddress, // e.g. "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         {
           "encoding": "jsonParsed",
+          "commitment": "processed",
           "filters": [
             {
               "dataSize": 165
@@ -89,7 +127,7 @@ async function getTokenBalances(tokenProgramAddress, tokenMintAddress) {
     return deserialized_accounts;
 
   } catch (error) {
-    throw new Error(`Error: ${error}`);
+    throw new Error(`getTokenBalances Error: ${error}`);
   }
 }
 
@@ -108,7 +146,7 @@ async function getPoolData(raydiumIdo, raydiumAuthority) {
         idoAccountString,
         {
           "encoding": "jsonParsed",
-          "commitment": "confirmed"
+          "commitment": "processed",
         }
       ],
     });
@@ -129,24 +167,26 @@ async function getPoolData(raydiumIdo, raydiumAuthority) {
     const marketResponse = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
       jsonrpc: '2.0',
       id: 1,
-      method: 'getProgramAccounts', // should i use getProgramAccounts instead?
+      method: 'getProgramAccounts',
       params: [
         "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX", // OpenBook program ID
         {
           "encoding": "jsonParsed",
-          "commitment": "confirmed",
-          filters: [
-            { dataSize: MARKET_STATE_LAYOUT_V3.span },
+          "commitment": "processed",
+          "filters": [
             {
-              memcmp: {
-                offset: MARKET_STATE_LAYOUT_V3.offsetOf("baseMint"),
-                bytes: poolInfo.baseMint.toBase58(),
+              "dataSize": MARKET_STATE_LAYOUT_V3.span
+            },
+            {
+              "memcmp": {
+                "offset": MARKET_STATE_LAYOUT_V3.offsetOf("baseMint"),
+                "bytes": poolInfo.baseMint.toBase58(),
               },
             },
             {
-              memcmp: {
-                offset: MARKET_STATE_LAYOUT_V3.offsetOf("quoteMint"),
-                bytes: poolInfo.quoteMint.toBase58(),
+              "memcmp": {
+                "offset": MARKET_STATE_LAYOUT_V3.offsetOf("quoteMint"),
+                "bytes": poolInfo.quoteMint.toBase58(),
               },
             },
           ],
@@ -171,51 +211,109 @@ async function getPoolData(raydiumIdo, raydiumAuthority) {
     return poolInfo;
 
   } catch (error) {
-    throw new Error(`Error: ${error}`);
+    throw new Error(`getPoolData Error: ${error}`);
   }
 }
 
 
 // Performs a token swap on the Raydium protocol. Depending on the configuration, it can execute the swap or simulate it.
-const swap = async (poolInfo, listingTime) => {
+const swap = async (poolInfo, buyOrSell, listingTime) => {
   const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
-  console.log(`Swapping ${swapConfig.tokenAAmount} of ${swapConfig.tokenAAddress} for ${swapConfig.tokenBAddress}...`);
-  console.log("TimeNow: " + Date.now());
-  console.log("SwapStartSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
+  let inTokenAmount;
+  let inTokenAddress;
+  let outTokenAddress;
+  if (buyOrSell == "buy") {
+    inTokenAmount = swapConfig.tokenAAmount;
+    inTokenAddress = swapConfig.tokenAAddress;
+    outTokenAddress = swapConfig.tokenBAddress;
+  } else if (buyOrSell == "sell") {
+    inTokenAmount = swapConfig.tokenBAmount;
+    inTokenAddress = swapConfig.tokenBAddress;
+    outTokenAddress = swapConfig.tokenAAddress;
+  } else {
+    throw new Error(`swap Error: ${buyOrSell} is not "buy" or "sell"`);
+  }
+  console.log(`=== IN: ${inTokenAmount} ${inTokenAddress} | OUT: ${outTokenAddress} ===`);
+  console.log("- TimeNow: " + Date.now());
+  console.log("- SwapStartSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
 
   // Prepare the swap transaction with the given parameters.
   const tx = await raydiumSwap.getSwapTransaction(
-    swapConfig.tokenBAddress,
-    swapConfig.tokenAAmount,
+    outTokenAddress,
+    inTokenAmount,
     poolInfo,
     swapConfig.maxLamports,
     swapConfig.useVersionedTransaction,
     swapConfig.direction
   );
 
-  const simRes = swapConfig.useVersionedTransaction
-    ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
-    : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
-  console.log(simRes);
-
   // Depending on the configuration, execute or simulate the swap.
   if (swapConfig.executeSwap) {
-    const txid = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
-      ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
-      : await raydiumSwap.sendLegacyTransaction(tx as Transaction, swapConfig.maxRetries);
-    console.log(`https://solscan.io/tx/${txid}`);
-    console.log("TransactionTime: " + listingTime);
-    console.log("TimeNow: " + Date.now());
-    console.log("ExecutionSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
+    let myTokenBalance = 0;
+    try {
+      const txid: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
+        ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
+        : await raydiumSwap.sendLegacyTransaction(tx as Transaction, swapConfig.maxRetries);
+      console.log(`- https://solscan.io/tx/${txid}`);
+    } catch (error) {
+      if (buyOrSell == "sell") {
+        console.log("Success: Insufficient funds error, everything sold!");
+        tradeInProgress = false;
+        return;
+      } else { // If a transaction attempt fails with a "buy", it is likely because the pool didn't launch yet, so we continue onward with our attempts
+        myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
+        swapConfig.tokenBAmount = myTokenBalance;
+        if (myTokenBalance > 0) {
+          console.log("!!! ERROR: SOMETHING FUNKY HAPPENED, SELLING JUST IN CASE !!!");
+          return await swap(poolInfo, "sell", listingTime);
+        }
+      }
+    }
+
+    // After the transaction, check balances (may not have happened immediately)
+    myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
+    swapConfig.tokenBAmount = myTokenBalance;
+    console.log("- myTokenBalance: " + myTokenBalance);
+
+    // Retry every 1 sec if failed
+    if ((buyOrSell == "buy" && myTokenBalance == 0) || (buyOrSell == "sell" && myTokenBalance > 0)) {
+      console.log("FAILED, DELAYING 5 SECONDS BEFORE RETRYING...");
+      await setTimeout(async () => {
+        await swap(poolInfo, buyOrSell, listingTime);
+      }, 5000);
+    } else {
+      console.log("TRANSACTION SUCCESSFUL!");
+      console.log("- PoolOpenTransactionTime: " + listingTime);
+      console.log("- TimeNow: " + Date.now());
+      console.log("- ExecutionSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
+
+      // Sell all after 30 sec
+      if (buyOrSell == "buy") {
+        console.log("WAITING 30 SEC THEN SELLING...");
+        await setTimeout(async () => {
+          myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
+          swapConfig.tokenBAmount = myTokenBalance;
+          console.log("=== SELLING ALL TOKENS NOW, AMOUNT: " + myTokenBalance + " ===");
+          await swap(poolInfo, "sell", listingTime);
+        }, 30000);
+      } else { // Sell successful! Log SOL amount and continue trading
+        const newSolBalance = await checkWalletBalance(swapConfig.tokenAAddress);
+        const solTradeResult = newSolBalance - startingSolBalance;
+        console.log("!!! TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL!!!");
+        console.log("!!! CONTINUING TRADING... !!!");
+        tradeInProgress = false;
+      }
+    }
   } else {
-    const simRes = swapConfig.useVersionedTransaction // Simulate the transaction and log the result.
+    const simRes: any = swapConfig.useVersionedTransaction // Simulate the transaction and log the result.
       ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
       : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
     console.log("Swap simulation successful! Details:");
     console.log(simRes);
-    console.log("TransactionTime: " + listingTime);
+    console.log("PoolOpenTransactionTime: " + listingTime);
     console.log("TimeNow: " + Date.now());
     console.log("ExecutionSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
+    tradeInProgress = false;
   }
 };
 
@@ -232,12 +330,12 @@ async function main(connection, programAddress) {
         ({ logs, err, signature }) => {
             if (err) return;
 
-            if (!tradeMade && logs && logs.some(log => log.includes("initialize2"))) {
+            if (!tradeInProgress && logs && logs.some(log => log.includes("initialize2"))) {
                 console.log("=== New LP Found ===");
                 analyzeAndExecuteTrade(signature, connection);
             }
         },
-        "confirmed" // "processed" is faster but sometimes too fast and we throw the "account not found error below"
+        "confirmed"
     );
 }
 
@@ -267,7 +365,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
         { "Token": "A", "Account Public Key": tokenAAccount.toBase58() },
         { "Token": "B", "Account Public Key": tokenBAccount.toBase58() }
     ];
-    console.log("TransactionTime: " + listingTime);
+    console.log("PoolOpenTransactionTime: " + listingTime);
     console.log("TimeNow: " + Date.now());
     console.log("DetectionSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
     console.log("Transaction: https://solscan.io/tx/" + txId);
@@ -276,7 +374,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
     // Continue if a SOL pair... FOR SIMPLICITY'S SAKE, ONLY TRADING PAIRS WHERE SOL IS THE TOKEN-A
     if (tokenAAccount == "So11111111111111111111111111111111111111112") {
       const tokenAccount = tokenBAccount;
-      swapConfig.tokenBAddress = tokenBAccount;
+      swapConfig.tokenBAddress = tokenBAccount.toBase58();
 
       // Check if mint and freeze authority are revoked
       const tokenDetails = execSync("sudo spl-token display " + tokenAccount.toBase58(), { encoding: 'utf-8' }).toString().split("\n");
@@ -305,14 +403,11 @@ async function analyzeAndExecuteTrade(txId, connection) {
       // If safe, gather the data we need for the swap, then perform the swap
       if (mintAuthority == "Mint authority: (not set)" && freezeAuthority == "Freeze authority: (not set)" && !highTokenConcentration && !singleBigTokenHolder && !spoofedDistribution && !sketchyDistribution) {
         const poolInfo = await getPoolData(raydiumIdo, raydiumAuthority);
-        tradeMade = true;
-        swap(poolInfo, listingTime);
-
-
-        // this works if i indeed keep catching them within 3 seconds of listing!
-        // buy with .01 SOL...
-        // sell 30 seconds later...
-        // [later] split sells into 4 25% sells every 15 seconds
+        tradeInProgress = true;
+        swapConfig.direction = 'in';
+        swapConfig.maxLamports = SLOW_PRIORITY_FEE * 1000000000; // Slow for spamming
+        startingSolBalance = await checkWalletBalance(swapConfig.tokenAAddress);
+        swap(poolInfo, "buy", listingTime);
       } else {
         console.log("~~~NOT SAFE, NOT TRADING~~~");
       }
@@ -326,6 +421,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
 main(connection, raydium).catch(console.error);
 
 
+
 // =========================
 // ===== SCRATCH NOTES =====
 // =========================
@@ -333,8 +429,20 @@ main(connection, raydium).catch(console.error);
 // fetchMarketAccounts("So11111111111111111111111111111111111111112", "3WMr8ncjho5hy3RBL4ZXydTjZcGSi7YxYLHLhq1zKP1F");
 // getPoolData(new PublicKey("FzWvfNEpLAbUo2MKC1tGRwSfKnsrmt961reTE2vGtGKg"), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
 // testing with https://solscan.io/tx/yRdAehjqcaRB5LrfSKQFF3vrKWeCGviYFiTmw56PAzY2zKoAwYwXLVBpXvQBenX9bKsSYvWz4teMqxgxZbLwaqV (token: 3WMr8ncjho5hy3RBL4ZXydTjZcGSi7YxYLHLhq1zKP1F)
+//
+// async function testFunction() {
+//     const poolInfo = await getPoolData(new PublicKey("6ytyRrE72DgjBmnr3eaJAv1DFov5CaP5XMBmnXWdXacd"), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
+//     swapConfig.tokenBAddress = "65zbFrDtB7L4bHxqHbBKL7mcfAPyzTJ4SnjiaiQLHD78";
+//     let myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
+//     swapConfig.tokenBAmount = myTokenBalance;
+//     await swap(poolInfo, "buy", Date.now());
+// }
+//
+// testFunction();
 
-
+// https://solscan.io/tx/4rATMCLAaBuXjbFJQtctUyhCH2XkNLE3tZF2wr3fKKbj3ZHx3xQ1ZTva7FnSnfBcqvcz7fH1BmdKio7T8u5XcYUp
+// ido: 6ytyRrE72DgjBmnr3eaJAv1DFov5CaP5XMBmnXWdXacd
+// tokenB: 65zbFrDtB7L4bHxqHbBKL7mcfAPyzTJ4SnjiaiQLHD78
 
 
 
@@ -407,79 +515,8 @@ main(connection, raydium).catch(console.error);
 // }
 
 
-//
-// {
-// y  id: PublicKey [PublicKey(BYEFi2Bquys5FT91XriudrH2kqZx2gYaUEQ6ypUogJQ4)] {
-//     _bn: <BN: 9c94dc369606dc3098ff9ef8e04ef436dbcf64b2210aea908cf3f700470a6a35>
-//   },
-// y  baseMint: PublicKey [PublicKey(HKgonhHkRSCtQWzCtQgFNsu8TEcf3oWau8xH87Si3LuB)] {
-//     _bn: <BN: f28474778f1f194ca52583b762ac1f60f66cc949b956a5f9a0539e9143970efe>
-//   },
-// y  quoteMint: PublicKey [PublicKey(So11111111111111111111111111111111111111112)] {
-//     _bn: <BN: 69b8857feab8184fb687f634618c035dac439dc1aeb3b5598a0f00000000001>
-//   },
-// y  lpMint: PublicKey [PublicKey(GhqWe5ZgZAZv6SpB5ajzsf6Xs8yWKzbd1v6TC6XnJVDX)] {
-//     _bn: <BN: e9556349df6bb7ccfeacfdf3efe911e8e8bb2fba58bba75ce72c07f9503c46be>
-//   },
-// y  baseDecimals: 6,
-// y  quoteDecimals: 9,
-// nN  lpDecimals: 6,
-// y  version: 4,
-// y  programId: PublicKey [PublicKey(675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8)] {
-//     _bn: <BN: 4bd949c43602c33f207790ed16a3524ca1b9975cf121a2a90cffec7df8b68acd>
-//   },
-// y  authority: PublicKey [PublicKey(5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1)] {
-//     _bn: <BN: 4157b0580f31c5fce44a62582dbcf9d78ee75943a084a393b350368d22899308>
-//   },
-// y  openOrders: PublicKey [PublicKey(BVAZAZSnsxaYFWRKrQ2BuGUJxmk7boG1bYVqYw3N5gsq)] {
-//     _bn: <BN: 9bcbef6fcbeb0f594487fbd0c94ccae4879924df08018f0c1d39ec895d63dd30>
-//   },
-// y  targetOrders: PublicKey [PublicKey(42BtD4tph5pKkwWYAeHTEaxYiLNWBZQaTozC6MBb1uP4)] {
-//     _bn: <BN: 2ce0f26951bda6ddc58b536723f1e33960090f0cac905d954472949527c4232f>
-//   },
-// y  baseVault: PublicKey [PublicKey(FiGHbjwnhjcCYcF2a4KngLaRj8zw9sTV7SVUMdzWAWPw)] {
-//     _bn: <BN: da95b6dbb969a0cc471c9a13caefe1361328fd5940634e5342322cbfefc0531e>
-//   },
-// y  quoteVault: PublicKey [PublicKey(DVpoas1ibW9omBq7DvzWApDaeVz5nF59985kkeVDtKdq)] {
-//     _bn: <BN: b9ae8e96a9a3d5261c17ca1d64e25cddb084ae8709cdb071097ad0bec0319ed8>
-//   },
-// y  withdrawQueue: PublicKey [PublicKey(11111111111111111111111111111111)] {
-//     _bn: <BN: 0>
-//   },
-// nN  lpVault: PublicKey [PublicKey(11111111111111111111111111111111)] {
-//     _bn: <BN: 0>
-//   },
-// y  marketVersion: 4,
-// y  marketProgramId: PublicKey [PublicKey(srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX)] {
-//     _bn: <BN: d0751a8282da61305fe299c37b998e58471db1135037310f8be1045a60af6ee>
-//   },
-// y  marketId: PublicKey [PublicKey(HxMEbmzdy3rUwvJH42b2NR8wqH7xyWy73zz26Tgwy1FK)] {
-//     _bn: <BN: fbe8d08411a1b4b8396f9fc7edd2201ee0afe04747d4b9ebeb6299f19c34debe>
-//   },
-// y  marketAuthority: PublicKey [PublicKey(2cxQ4FqfQR7jvFDFMEAJMaGqawRU7gTRZfXtiSRRra6a)] {
-//     _bn: <BN: 1811a746789c6649f684d5887ddde8e7238e23e6a963a6bc6b28b3c594ef16cf>
-//   },
-// y  marketBaseVault: PublicKey [PublicKey(4XX8AwAn9NReRfBipoebxCBt8jXwuMy7ufjneP7qfhPy)] {
-//     _bn: <BN: 34648bc43586be81057ef2963305b960fe2cb729b57103c95fd12e62e58e0084>
-//   },
-// y  marketQuoteVault: PublicKey [PublicKey(FnpvRnkKznjeqzsuV9ceCNA5aSddN3b4fgNbu8R5SgfB)] {
-//     _bn: <BN: dbc0f0214853141530b43268abde77cb5d346ba6048dbedd3f5f137d7324a00a>
-//   },
-// y  marketBids: PublicKey [PublicKey(7xudwbqcW6oA2iBomv6X2zvxQ35215LsmAhEgJ6ckzgQ)] {
-//     _bn: <BN: 677895333c043cbb71853c4c4ccc07b3f61496b7f91336185c0067836e0c14b9>
-//   },
-// y  marketAsks: PublicKey [PublicKey(5WzzPFZqDqafnc3XFsF9xJv6mLok4FPJRbAa9cR6NaHT)] {
-//     _bn: <BN: 431e28f3419e20fa5f686fdb10ef47e072e3894b9e43961b13df301df65194b6>
-//   },
-// y  marketEventQueue: PublicKey [PublicKey(D5U7nM5nMWTgBFANKSLhgnBUh6qgaw2Ux391vmSNjLgK)] {
-//     _bn: <BN: b3713a416ebb746635df35388a24d898dc20fc533b395ae14488a1eeb1aa5b94>
-//   }
-// }
 
-
-
-
-
+// USDC
 // swap({
 //   id: PublicKey [PublicKey(58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2)] {
 //     _bn: <BN: 3d6e472e67a46ea6b4bd0bab9dfd35e2b4c72f1d6d59c2eab95c942573ad22f1>

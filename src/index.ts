@@ -26,7 +26,7 @@ const MY_WALLET = "HDaBHzbsGnUS8tS9cPRsMZ5wEKWR12gZWsiK5XfgdFYD";
 let swapConfig = {
   executeSwap: true, // Send tx when true, simulate tx when false
   useVersionedTransaction: true,
-  tokenAAmount: 0.001, // Swap 0.01 SOL for USDC in this example
+  tokenAAmount: 0.001, // Swap 0.001 SOL for USDC in this example
   tokenBAmount: 0,
   tokenAAddress: "So11111111111111111111111111111111111111112", // Token to swap for the other, SOL in this case
   tokenBAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC address
@@ -249,6 +249,7 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
     inTokenAmount = swapConfig.tokenBAmount;
     inTokenAddress = swapConfig.tokenBAddress;
     outTokenAddress = swapConfig.tokenAAddress;
+    swapConfig.maxLamports = FAST_PRIORITY_FEE * 1000000000;
   } else {
     throw new Error(`swap Error: ${buyOrSell} is not "buy" or "sell"`);
   }
@@ -256,30 +257,34 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
   console.log("- TimeNow: " + Date.now());
   console.log("- SwapStartSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
 
-  // Prepare the swap transaction with the given parameters.
-  const tx = await raydiumSwap.getSwapTransaction(
-    outTokenAddress,
-    inTokenAmount,
-    poolInfo,
-    swapConfig.maxLamports,
-    swapConfig.useVersionedTransaction,
-    swapConfig.direction
-  );
-
   // Depending on the configuration, execute or simulate the swap.
   if (swapConfig.executeSwap) {
     let myTokenBalance = 0;
     try {
+      const tx = await raydiumSwap.getSwapTransaction( // Prepare the swap transaction with the given parameters.
+        outTokenAddress,
+        inTokenAmount,
+        poolInfo,
+        swapConfig.maxLamports,
+        swapConfig.useVersionedTransaction,
+        swapConfig.direction
+      );
       const txid: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
         ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
         : await raydiumSwap.sendLegacyTransaction(tx as Transaction, swapConfig.maxRetries);
       console.log(`- https://solscan.io/tx/${txid}`);
     } catch (error) {
       if (buyOrSell == "sell") {
-        console.log("Success: Insufficient funds error, everything sold!");
+        myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
+        swapConfig.tokenBAmount = myTokenBalance;
+        if (myTokenBalance == 0) {
+          console.log("Success: Insufficient funds error, everything sold!");
+        } else {
+          console.log("Yikes, pool rugged before sale!");
+        }
         const newSolBalance = await checkSolBalance();
         const solTradeResult = newSolBalance - startingSolBalance;
-        console.log("!!! TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL!!!");
+        console.log("$$$ TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL $$$");
         console.log("!!! CONTINUING TRADING... !!!");
         tradeInProgress = false;
         return;
@@ -288,6 +293,12 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
         swapConfig.tokenBAmount = myTokenBalance;
         if (myTokenBalance > 0) { // ...unless we see tokens in our account, in which case it doesn't really matter and we should try to sell
           return await swap(poolInfo, "sell", listingTime);
+        }
+        if (error) {
+          console.log(error);
+          console.log("ERROR RETURNED, POOL NOT LAUNCHED YET, CONTINUE WITH LOW-FEE PING EVERY 5-SEC");
+        } else {
+          console.log("NO ERROR RETURNED, POOL LAUNCHED BUT TRANSACTION FAILED, TODO: SPAM WITH FASTER FREQUENCY! (AND RAISE FEE TO BE FAST)");
         }
       }
     }
@@ -321,12 +332,20 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
       } else { // Sell successful! Log SOL amount and continue trading
         const newSolBalance = await checkSolBalance();
         const solTradeResult = newSolBalance - startingSolBalance;
-        console.log("!!! TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL!!!");
+        console.log("$$$ TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL $$$");
         console.log("!!! CONTINUING TRADING... !!!");
         tradeInProgress = false;
       }
     }
   } else {
+    const tx = await raydiumSwap.getSwapTransaction( // Prepare the swap transaction with the given parameters.
+      outTokenAddress,
+      inTokenAmount,
+      poolInfo,
+      swapConfig.maxLamports,
+      swapConfig.useVersionedTransaction,
+      swapConfig.direction
+    );
     const simRes: any = swapConfig.useVersionedTransaction // Simulate the transaction and log the result.
       ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
       : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
@@ -429,6 +448,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
         swapConfig.direction = 'in';
         swapConfig.maxLamports = SLOW_PRIORITY_FEE * 1000000000; // Slow for spamming
         startingSolBalance = await checkSolBalance();
+        console.log("startingSolBalance: " + startingSolBalance + " SOL");
         swap(poolInfo, "buy", listingTime);
       } else {
         console.log("~~~NOT SAFE, NOT TRADING~~~");

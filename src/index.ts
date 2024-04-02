@@ -18,22 +18,24 @@ const connection = new Connection(`https://frosty-little-smoke.solana-mainnet.qu
 // ===== GLOBAL VARIABLES =====
 // ============================
 
-const SLOW_PRIORITY_FEE = .0001; // 0.000008333 // 0.000012173
-const FAST_PRIORITY_FEE = .0008; // 0.000008333 // 0.000012173
+const SLOW_PRIORITY_FEE = .000001 * 1000000000; // 0.000008333 // 0.000012173
+const FAST_PRIORITY_FEE = .001 * 1000000000; // 0.000008333 // 0.000012173
 
 const MY_WALLET = "HDaBHzbsGnUS8tS9cPRsMZ5wEKWR12gZWsiK5XfgdFYD";
 
 let swapConfig = {
   executeSwap: true, // Send tx when true, simulate tx when false
   useVersionedTransaction: true,
-  tokenAAmount: 0.001, // Swap 0.001 SOL for USDC in this example
+  tokenAAmount: 0.1, // Swap 0.1 SOL for USDC in this example
   tokenBAmount: 0,
   tokenAAddress: "So11111111111111111111111111111111111111112", // Token to swap for the other, SOL in this case
   tokenBAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC address
-  maxLamports: SLOW_PRIORITY_FEE * 1000000000, // Micro lamports for priority fee
+  maxLamports: FAST_PRIORITY_FEE, // Micro lamports for priority fee
   direction: "in" as "in" | "out", // Swap direction: 'in' or 'out'
   liquidityFile: "https://api.raydium.io/v2/sdk/liquidity/mainnet.json",
   maxRetries: 20,
+  retryFrequency: 2000,
+  tradingOpen: true,
 };
 
 let tradeInProgress = false; // prevents concurrent trade sequences, forces 1 token to be traded at a time
@@ -238,6 +240,7 @@ async function getPoolData(raydiumIdo, raydiumAuthority) {
 // Performs a token swap on the Raydium protocol. Depending on the configuration, it can execute the swap or simulate it.
 const swap = async (poolInfo, buyOrSell, listingTime) => {
   const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
+  let tradingOpenTime = listingTime;
   let inTokenAmount;
   let inTokenAddress;
   let outTokenAddress;
@@ -249,18 +252,22 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
     inTokenAmount = swapConfig.tokenBAmount;
     inTokenAddress = swapConfig.tokenBAddress;
     outTokenAddress = swapConfig.tokenAAddress;
-    swapConfig.maxLamports = FAST_PRIORITY_FEE * 1000000000;
+    swapConfig.retryFrequency = 2000;
+    swapConfig.maxLamports = FAST_PRIORITY_FEE;
   } else {
     throw new Error(`swap Error: ${buyOrSell} is not "buy" or "sell"`);
   }
   console.log(`=== IN: ${inTokenAmount} ${inTokenAddress} | OUT: ${outTokenAddress} ===`);
   console.log("- TimeNow: " + Date.now());
-  console.log("- SwapStartSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
+  console.log("- SwapStartSpeed: " + ((Date.now() - tradingOpenTime) / 1000) + " seconds after listing");
+
 
   // Depending on the configuration, execute or simulate the swap.
   if (swapConfig.executeSwap) {
     let myTokenBalance = 0;
     try {
+
+      // Try to make a trade
       const tx = await raydiumSwap.getSwapTransaction( // Prepare the swap transaction with the given parameters.
         outTokenAddress,
         inTokenAmount,
@@ -272,7 +279,16 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
       const txid: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
         ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
         : await raydiumSwap.sendLegacyTransaction(tx as Transaction, swapConfig.maxRetries);
+      console.log("- POOL IS OPEN");
       console.log(`- https://solscan.io/tx/${txid}`);
+      swapConfig.retryFrequency = 2000;
+      swapConfig.maxLamports = FAST_PRIORITY_FEE;
+      if (swapConfig.tradingOpen == false) {
+        swapConfig.tradingOpen = true;
+        tradingOpenTime = Date.now();
+      }
+
+    // If a transaction error occurs, its because insufficient funds, or pool not open yet
     } catch (error) {
       if (buyOrSell == "sell") {
         myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
@@ -288,37 +304,51 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
         console.log("!!! CONTINUING TRADING... !!!");
         tradeInProgress = false;
         return;
-      } else { // If a transaction attempt fails with a "buy", it is likely because the pool didn't launch yet, so we continue onward with our attempts
+
+      // If a transaction attempt fails with a "buy", it is likely because the pool didn't launch yet, so we continue onward with our attempts
+      } else {
         myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
         swapConfig.tokenBAmount = myTokenBalance;
         if (myTokenBalance > 0) { // ...unless we see tokens in our account, in which case it doesn't really matter and we should try to sell
-          return await swap(poolInfo, "sell", listingTime);
+          console.log("TRANSACTION SUCCESSFUL!");
+          console.log("- PoolOpenTransactionTime: " + tradingOpenTime);
+          console.log("- TimeNow: " + Date.now());
+          console.log("- ExecutionSpeed: " + ((Date.now() - tradingOpenTime) / 1000) + " seconds after listing");
+          console.log("WAITING 30 SEC THEN SELLING...");
+          return await setTimeout(async () => {
+            myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
+            swapConfig.tokenBAmount = myTokenBalance;
+            console.log("=== SELLING ALL TOKENS NOW, AMOUNT: " + myTokenBalance + " ===");
+            await swap(poolInfo, "sell", tradingOpenTime);
+          }, 30000);
         }
         if (error) {
-          console.log(error);
-          console.log("ERROR RETURNED, POOL NOT LAUNCHED YET, CONTINUE WITH LOW-FEE PING EVERY 5-SEC");
-        } else {
-          console.log("NO ERROR RETURNED, POOL LAUNCHED BUT TRANSACTION FAILED, TODO: SPAM WITH FASTER FREQUENCY! (AND RAISE FEE TO BE FAST)");
+          console.log("~~~ ERROR RETURNED, POOL NOT LAUNCHED YET, CONTINUE WITH LOW-FEE PING EVERY 5-SEC ~~~");
+          swapConfig.retryFrequency = 5000;
+          swapConfig.maxLamports = SLOW_PRIORITY_FEE;
+          swapConfig.tradingOpen = false;
         }
       }
     }
 
     // After the transaction, check balances (may not have happened immediately)
-    myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
-    swapConfig.tokenBAmount = myTokenBalance;
-    console.log("- myTokenBalance: " + myTokenBalance);
+    if (swapConfig.tradingOpen == true) {
+      myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
+      swapConfig.tokenBAmount = myTokenBalance;
+      console.log("- myTokenBalance: " + myTokenBalance);
+    }
 
-    // Retry every 1 sec if failed
+    // Retry if failed
     if ((buyOrSell == "buy" && myTokenBalance == 0) || (buyOrSell == "sell" && myTokenBalance > 0)) {
-      console.log("FAILED, DELAYING 5 SECONDS BEFORE RETRYING...");
+      console.log("FAILED, DELAYING AND RETRYING...");
       await setTimeout(async () => {
-        await swap(poolInfo, buyOrSell, listingTime);
-      }, 5000);
+        await swap(poolInfo, buyOrSell, tradingOpenTime);
+      }, swapConfig.retryFrequency);
     } else {
       console.log("TRANSACTION SUCCESSFUL!");
-      console.log("- PoolOpenTransactionTime: " + listingTime);
+      console.log("- PoolOpenTransactionTime: " + tradingOpenTime);
       console.log("- TimeNow: " + Date.now());
-      console.log("- ExecutionSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
+      console.log("- ExecutionSpeed: " + ((Date.now() - tradingOpenTime) / 1000) + " seconds after listing");
 
       // Sell all after 30 sec
       if (buyOrSell == "buy") {
@@ -327,7 +357,7 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
           myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
           swapConfig.tokenBAmount = myTokenBalance;
           console.log("=== SELLING ALL TOKENS NOW, AMOUNT: " + myTokenBalance + " ===");
-          await swap(poolInfo, "sell", listingTime);
+          await swap(poolInfo, "sell", tradingOpenTime);
         }, 30000);
       } else { // Sell successful! Log SOL amount and continue trading
         const newSolBalance = await checkSolBalance();
@@ -351,9 +381,9 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
       : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
     console.log("Swap simulation successful! Details:");
     console.log(simRes);
-    console.log("PoolOpenTransactionTime: " + listingTime);
+    console.log("PoolOpenTransactionTime: " + tradingOpenTime);
     console.log("TimeNow: " + Date.now());
-    console.log("ExecutionSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
+    console.log("ExecutionSpeed: " + ((Date.now() - tradingOpenTime) / 1000) + " seconds after listing");
     tradeInProgress = false;
   }
 };
@@ -446,7 +476,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
         const poolInfo = await getPoolData(raydiumIdo, raydiumAuthority);
         tradeInProgress = true;
         swapConfig.direction = 'in';
-        swapConfig.maxLamports = SLOW_PRIORITY_FEE * 1000000000; // Slow for spamming
+        swapConfig.tradingOpen = true;
         startingSolBalance = await checkSolBalance();
         console.log("startingSolBalance: " + startingSolBalance + " SOL");
         swap(poolInfo, "buy", listingTime);
@@ -464,6 +494,7 @@ main(connection, raydium).catch(console.error);
 
 
 
+
 // =========================
 // ===== SCRATCH NOTES =====
 // =========================
@@ -473,11 +504,11 @@ main(connection, raydium).catch(console.error);
 // testing with https://solscan.io/tx/yRdAehjqcaRB5LrfSKQFF3vrKWeCGviYFiTmw56PAzY2zKoAwYwXLVBpXvQBenX9bKsSYvWz4teMqxgxZbLwaqV (token: 3WMr8ncjho5hy3RBL4ZXydTjZcGSi7YxYLHLhq1zKP1F)
 //
 // async function testFunction() {
-//     const poolInfo = await getPoolData(new PublicKey("6ytyRrE72DgjBmnr3eaJAv1DFov5CaP5XMBmnXWdXacd"), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
-//     swapConfig.tokenBAddress = "65zbFrDtB7L4bHxqHbBKL7mcfAPyzTJ4SnjiaiQLHD78";
+//     const poolInfo = await getPoolData(new PublicKey("8XtEhvzDAHDyBXEJpwtEbf39dBzhh4dvYEDzJSM2LNsM"), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
+//     swapConfig.tokenBAddress = "DVFHjutmfpc8f6BVGBY645QuVYpNnsqnUyLpnZYwMoCB";
 //     let myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
 //     swapConfig.tokenBAmount = myTokenBalance;
-//     await swap(poolInfo, "buy", Date.now());
+//     await swap(poolInfo, "sell", Date.now());
 // }
 //
 // testFunction();

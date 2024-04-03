@@ -1,3 +1,3 @@
 # George
 
-Solana sniper bot. Use `yarn start`.
+Solana sniper bot. Use `sudo yarn start`.

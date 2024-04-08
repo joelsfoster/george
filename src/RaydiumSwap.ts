@@ -93,12 +93,13 @@ class RaydiumSwap {
    */
   async getSwapTransaction(
     toToken: string,
-    // fromToken: string,
     amount: number,
     poolKeys: LiquidityPoolKeys,
     maxLamports: number = 100000,
     useVersionedTransaction = true,
-    fixedSide: 'in' | 'out' = 'in'
+    fixedSide: 'in' | 'out' = 'in',
+    command,
+    primedTokenAccount,
   ): Promise<Transaction | VersionedTransaction> {
     const directionIn = poolKeys.quoteMint.toString() == toToken
     const { minAmountOut, amountIn } = await this.calcAmountOut(poolKeys, amount, directionIn)
@@ -126,8 +127,29 @@ class RaydiumSwap {
       },
     })
 
+    // Precreate tokenAccount only does instructions 1, 2, and 3. (compute, create tokenAccount, initialize tokenAccount)
+    // Buy only does instructions 1, 4, and 5. (compute, create memecoin tokenAccount, raydium swap)
+    // Sell only does instruction 1 and 5. (compute, raydium swap)
+    // CloseAccount only does instruction 6. (close account)
+    const computeBudgetInstruction = (command == "buy" || command == "sell") && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(0, 1) : null; // instruction 1
+    const buyRaydiumInstructions = command == "buy" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(3, 5) : null; // instructions 4 and 5
+    const sellRaydiumInstructions = command == "sell" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(3, 4) : null; // instruction 5
+    const closeAccountInstructions = command == "closeAccount" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(5, 6) : null; // instruction 6
+    const createAccountInstructions = command == "precreateAccount" ? swapTransaction.innerTransactions[0].instructions.slice(0, 3) : null; // instructions 1, 2, and 3
+    const instructionsArray = command == "precreateAccount" ? createAccountInstructions : command == "buy" && primedTokenAccount ? computeBudgetInstruction.concat(buyRaydiumInstructions) : command == "sell" && primedTokenAccount ? computeBudgetInstruction.concat(sellRaydiumInstructions) : command == "closeAccount" && primedTokenAccount ? closeAccountInstructions : swapTransaction.innerTransactions[0].instructions;
+
+    if (command == "buy" && primedTokenAccount) {
+      instructionsArray[2].keys[15].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 5 as "Source Account"
+    }
+    if (command == "sell" && primedTokenAccount) {
+      instructionsArray[1].keys[16].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 5 as "Destination Account"
+    }
+    if (command == "closeAccount" && primedTokenAccount) {
+      instructionsArray[0].keys[0].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 6
+    }
+
     const recentBlockhashForSwap = await this.connection.getLatestBlockhash()
-    const instructions = swapTransaction.innerTransactions[0].instructions.filter(Boolean)
+    const instructions = instructionsArray.filter(Boolean)
 
     if (useVersionedTransaction) {
       const versionedTransaction = new VersionedTransaction(

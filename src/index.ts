@@ -1,15 +1,18 @@
 import 'dotenv/config';
 import RaydiumSwap from './RaydiumSwap';
-import { Transaction, VersionedTransaction, Connection, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { Transaction, VersionedTransaction, Connection, PublicKey, LAMPORTS_PER_SOL, TransactionMessage, Keypair } from "@solana/web3.js";
+import spl from "@solana/spl-token";
 import { execSync } from 'child_process';
+import { Wallet } from '@coral-xyz/anchor'
 import axios from 'axios';
-import { LIQUIDITY_STATE_LAYOUT_V4, MARKET_STATE_LAYOUT_V3, Market } from "@raydium-io/raydium-sdk";
+import { LIQUIDITY_STATE_LAYOUT_V4, MARKET_STATE_LAYOUT_V3, Market, TOKEN_PROGRAM_ID, SPL_ACCOUNT_LAYOUT } from "@raydium-io/raydium-sdk";
+import bs58 from 'bs58'
 
 const SESSION_HASH = 'QNDEMO' + Math.ceil(Math.random() * 1e9); // Random unique identifier for your session
 const RAYDIUM_PUBLIC_KEY = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"; // --> Raydium "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" // --> competitor sniper bot "AupTbxArPau5H97izWurgska1hEvFNrYM1U8Yy9ijrWU"
 const raydium = new PublicKey(RAYDIUM_PUBLIC_KEY);
-const connection = new Connection(`https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/`, {
-    wsEndpoint: `wss://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/`,
+const connection = new Connection(process.env.RPC_URL, {
+    wsEndpoint: process.env.WS_URL,
     httpHeaders: {"x-session-hash": SESSION_HASH}
 });
 
@@ -22,11 +25,12 @@ const BUY_PRIORITY_FEE = .00001 * 1000000000; // 0.000008333 // 0.000012173
 const SELL_PRIORITY_FEE = .00004 * 1000000000; // 0.000008333 // 0.000012173
 
 const MY_WALLET = "HDaBHzbsGnUS8tS9cPRsMZ5wEKWR12gZWsiK5XfgdFYD";
+const PRIMED_TOKEN_ACCOUNT = new PublicKey("GLwbCu3z1MS922jSVvbCSwkULUfq6btAphJhc2SeCCc4");
 
 let swapConfig = {
   executeSwap: true, // Send tx when true, simulate tx when false
   useVersionedTransaction: true,
-  tokenAAmount: 0.01, // Swap 0.1 SOL for USDC in this example
+  tokenAAmount: 0.0001, // Swap 0.1 SOL for USDC in this example
   tokenBAmount: 0,
   tokenAAddress: "So11111111111111111111111111111111111111112", // Token to swap for the other, SOL in this case
   tokenBAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC address
@@ -60,7 +64,7 @@ let transactionAttemptCount = 0;
 // Helper function to get my SOL balance
 async function checkSolBalance() {
   try {
-    const response = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
+    const response = await axios.post(process.env.RPC_URL, {
       jsonrpc: '2.0',
       id: 1,
       method: 'getBalance',
@@ -84,7 +88,7 @@ async function checkSolBalance() {
 // Helper function to see my balance of a token
 async function checkWalletBalance(tokenMintAddress) {
   try {
-    const response = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
+    const response = await axios.post(process.env.RPC_URL, {
       jsonrpc: '2.0',
       id: 1,
       method: 'getTokenAccountsByOwner',
@@ -115,7 +119,7 @@ async function checkWalletBalance(tokenMintAddress) {
 // Helper function to get top token holders
 async function getTokenBalances(tokenProgramAddress, tokenMintAddress) {
   try {
-    const response = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
+    const response = await axios.post(process.env.RPC_URL, {
       jsonrpc: '2.0',
       id: 1,
       method: 'getProgramAccounts',
@@ -167,7 +171,7 @@ async function getPoolData(raydiumIdo, raydiumAuthority) {
 
     // First, get liquidity pool info from Raydium
     const idoAccountString = raydiumIdo.toBase58();
-    const liquidityResponse = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
+    const liquidityResponse = await axios.post(process.env.RPC_URL, {
       jsonrpc: '2.0',
       id: 1,
       method: 'getAccountInfo',
@@ -193,7 +197,7 @@ async function getPoolData(raydiumIdo, raydiumAuthority) {
     poolInfo.marketVersion = 4; // MIGHT BREAK?!?
 
     // Second, get market info from OpenBook
-    const marketResponse = await axios.post("https://frosty-little-smoke.solana-mainnet.quiknode.pro/73dd488f4f17e21f5d57bf14098b87a2de4e7d81/", {
+    const marketResponse = await axios.post(process.env.RPC_URL, {
       jsonrpc: '2.0',
       id: 1,
       method: 'getProgramAccounts',
@@ -246,15 +250,15 @@ async function getPoolData(raydiumIdo, raydiumAuthority) {
 
 
 // Helper function used in swap() to sell a token
-const sell = async (poolInfo, listingTime) => {
+async function sell(poolInfo, listingTime, primedTokenAccount) {
   await refreshBalance();
   console.log("=== SELLING ALL TOKENS NOW, AMOUNT: " + swapConfig.tokenBAddress + " ===");
-  await swap(poolInfo, "sell", listingTime);
+  await swap(poolInfo, "sell", listingTime, primedTokenAccount);
 }
 
 
 // Helper function used in swap() whenever a successful trade sequence is finished
-const success = async () => {
+async function success() {
   const newSolBalance = await checkSolBalance();
   const solTradeResult = newSolBalance - startingSolBalance;
   console.log("$$$ TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL $$$");
@@ -264,9 +268,87 @@ const success = async () => {
 
 
 // Helper function used in swap() to get updated token balances
-const refreshBalance = async () => {
+async function refreshBalance() {
   let myTokenBalance = await checkWalletBalance(swapConfig.tokenBAddress);
   swapConfig.tokenBAmount = myTokenBalance;
+}
+
+
+// When first detecting a new listing, we need to have a pre-created tokenAccount ready and funded so that the actual buy transaction goes through faster
+async function precreateTokenAccount(poolInfo, solAmount) {
+  try {
+    const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
+    const creationTx = await raydiumSwap.getSwapTransaction(
+      swapConfig.tokenBAddress,
+      solAmount,
+      poolInfo,
+      swapConfig.maxLamports,
+      swapConfig.useVersionedTransaction,
+      swapConfig.direction,
+      "precreateAccount",
+      null
+    );
+    const creationTxId: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
+      ? await raydiumSwap.sendVersionedTransaction(creationTx as VersionedTransaction, swapConfig.maxRetries)
+      : await raydiumSwap.sendLegacyTransaction(creationTx as Transaction, swapConfig.maxRetries);
+    console.log(`PRE-CREATING TOKENACCOUNT: https://solscan.io/tx/${creationTxId}`);
+
+  } catch (error) {
+    console.log(error);
+    return console.log("~~~ ERROR PRE-CREATING TOKENACCOUNT, RETRYING... ~~~");
+  }
+}
+
+
+// Close unused tokenAccounts
+async function closeOldTokenAccounts(poolInfo) {
+  try {
+    const walletTokenAccounts = await axios.post(process.env.RPC_URL, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTokenAccountsByOwner',
+      params: [
+        new PublicKey(MY_WALLET),
+        {
+          "programId": TOKEN_PROGRAM_ID,
+        },
+        {
+          "encoding": "jsonParsed",
+          "commitment": "processed",
+        },
+      ],
+    });
+
+    const accounts = walletTokenAccounts.data.result.value.map((i) => ({
+      pubkey: i.pubkey,
+      programId: i.account.owner,
+      accountInfo: i.account.data.parsed.info,
+    }))
+
+    const wSolAccounts = accounts.filter(ix => ix.accountInfo.mint === "So11111111111111111111111111111111111111112").sort(function(a, b){return b.accountInfo.tokenAmount.uiAmount-a.accountInfo.tokenAmount.uiAmount});
+
+    if (wSolAccounts.length > 1) {
+      const tokenAccount = new PublicKey(wSolAccounts[1].pubkey);
+      const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
+      const tx = await raydiumSwap.getSwapTransaction( // Prepare the swap transaction with the given parameters.
+        swapConfig.tokenBAddress,
+        .0001,
+        poolInfo,
+        swapConfig.maxLamports,
+        swapConfig.useVersionedTransaction,
+        swapConfig.direction,
+        "closeAccount",
+        tokenAccount
+      );
+      const txid: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
+        ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
+        : await raydiumSwap.sendLegacyTransaction(tx as Transaction, swapConfig.maxRetries);
+      console.log(`CLOSED AN OLD TOKENACCOUNT: https://solscan.io/tx/${txid}`);
+    }
+  } catch (error) {
+    console.log(error);
+    return console.log("~~~ ERROR WITH closeOldTokenAccounts() ~~~");
+  }
 }
 
 
@@ -276,7 +358,7 @@ const refreshBalance = async () => {
 
 
 // Performs a token swap on the Raydium protocol. Depending on the configuration, it can execute the swap or simulate it.
-const swap = async (poolInfo, buyOrSell, listingTime) => {
+async function swap(poolInfo, buyOrSell, listingTime, primedTokenAccount) {
   const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
   let inTokenAmount;
   let inTokenAddress;
@@ -305,7 +387,9 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
         poolInfo,
         swapConfig.maxLamports,
         swapConfig.useVersionedTransaction,
-        swapConfig.direction
+        swapConfig.direction,
+        buyOrSell,
+        primedTokenAccount
       );
       const txid: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
         ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
@@ -335,11 +419,12 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
           console.log("WAITING THEN SELLING...");
           return await setTimeout(async () => {
             transactionAttemptCount = 0;
-            await sell(poolInfo, listingTime);
+            await sell(poolInfo, listingTime, primedTokenAccount);
           }, swapConfig.sellDelay);
         }
         if (error) {
           pingCount++;
+          console.log(error);
           console.log("pingCount: [[[ " + pingCount + " ]]]");
           console.log("~~~ POOL NOT LAUNCHED YET, CONTINUE PINGING... ~~~");
         }
@@ -354,7 +439,7 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
     if ((buyOrSell == "buy" && swapConfig.tokenBAmount == 0) || (buyOrSell == "sell" && swapConfig.tokenBAmount > 0)) {
       console.log("POOL LAUNCHED, TRANSACTION FAILED, DELAYING AND RETRYING...");
       await setTimeout(async () => {
-        await swap(poolInfo, buyOrSell, listingTime);
+        await swap(poolInfo, buyOrSell, listingTime, primedTokenAccount);
       }, swapConfig.retryFrequency);
     } else {
 
@@ -364,7 +449,7 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
         console.log("WAITING THEN SELLING...");
         transactionAttemptCount = 0;
         await setTimeout(async () => {
-          await sell(poolInfo, listingTime);
+          await sell(poolInfo, listingTime, primedTokenAccount);
         }, swapConfig.sellDelay);
       } else { // Sell successful! Log SOL amount and continue trading
         console.log("SELL SUCCESSFUL AT " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
@@ -378,7 +463,9 @@ const swap = async (poolInfo, buyOrSell, listingTime) => {
       poolInfo,
       swapConfig.maxLamports,
       swapConfig.useVersionedTransaction,
-      swapConfig.direction
+      swapConfig.direction,
+      buyOrSell,
+      primedTokenAccount
     );
     const simRes: any = swapConfig.useVersionedTransaction // Simulate the transaction and log the result.
       ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
@@ -450,11 +537,15 @@ async function analyzeAndExecuteTrade(txId, connection) {
 
     // Continue if a SOL pair... FOR SIMPLICITY'S SAKE, ONLY TRADING PAIRS WHERE SOL IS THE TOKEN-A
     if (tokenAAccount == "So11111111111111111111111111111111111111112") {
+
+      // // USED IN JANKY TEST TO PRECREATE A FUNDED TOKENACCOUNT
+      // const testPoolInfo = await getPoolData(raydiumIdo, raydiumAuthority);
+      // precreateTokenAccount(testPoolInfo, .1);
+
       if (((Date.now() - listingTime) / 1000) < 10) { // Only trade if pool detected within 10 seconds
-        const tokenAccount = tokenBAccount;
 
         // Check if mint and freeze authority are revoked
-        const tokenDetails = execSync("sudo spl-token display " + tokenAccount.toBase58(), { encoding: 'utf-8' }).toString().split("\n");
+        const tokenDetails = execSync("sudo spl-token display " + tokenBAccount.toBase58(), { encoding: 'utf-8' }).toString().split("\n");
         const tokenProgram = tokenDetails[3].split(":")[1].trim();
         const tokenDecimals = Number(tokenDetails[5].split(":")[1].trim());
         const tokenSupply = Number(tokenDetails[4].split(":")[1].trim()) / (10 ** tokenDecimals);
@@ -464,7 +555,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
         if (freezeAuthority == "Freeze authority: (not set)") { console.log("SAFE: FREEZE AUTH REVOKED") } else { console.log("DANGER: CAN FREEZE TOKEN") }
 
         // Verify the top 10 holders hold less than 70% of the total supply, and no single holder has more than 20% of the total supply
-        const topTokenHolders = await getTokenBalances(tokenProgram, tokenAccount);
+        const topTokenHolders = await getTokenBalances(tokenProgram, tokenBAccount);
         const topTenHoldersSupply = topTokenHolders[0] + topTokenHolders[1] + topTokenHolders[2] + topTokenHolders[3] + topTokenHolders[4] + topTokenHolders[5] + topTokenHolders[6] + topTokenHolders[7] + topTokenHolders[8] + topTokenHolders[9];
         const highTokenConcentration = topTenHoldersSupply > (tokenSupply * .7);
         const spoofedDistribution = topTokenHolders.length !== new Set(topTokenHolders).size; // Detects duplicate token holder amounts
@@ -479,7 +570,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
 
         // If safe, gather the data we need for the swap, then perform the swap
         if (mintAuthority == "Mint authority: (not set)" && freezeAuthority == "Freeze authority: (not set)" && !highTokenConcentration && !singleBigTokenHolder && !spoofedDistribution && !sketchyDistribution) {
-          if (tradeInProgress == false) {
+          if (!tradeInProgress) {
             tradeInProgress = true;
             console.log("!!! GOOD POOL, INITIATING TRADE !!!");
             tradeCount++;
@@ -492,7 +583,8 @@ async function analyzeAndExecuteTrade(txId, connection) {
             console.log("startingSolBalance: " + startingSolBalance + " SOL");
             pingCount = 0;
             transactionAttemptCount = 0;
-            swap(poolInfo, "buy", listingTime);
+            closeOldTokenAccounts(poolInfo);
+            swap(poolInfo, "buy", listingTime, PRIMED_TOKEN_ACCOUNT);
           }
         } else {
           return console.log("~~~ NOT SAFE, NOT TRADING... MOVING ON... ~~~");
@@ -511,13 +603,21 @@ async function manualSell(ido, mint) {
     const poolInfo = await getPoolData(new PublicKey(ido), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
     swapConfig.tokenBAddress = mint;
     await refreshBalance();
-    await swap(poolInfo, "sell", Date.now());
+    await swap(poolInfo, "sell", Date.now(), PRIMED_TOKEN_ACCOUNT);
+}
+
+async function manualBuy(ido, mint) {
+    const poolInfo = await getPoolData(new PublicKey(ido), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
+    swapConfig.tokenBAddress = mint;
+    await swap(poolInfo, "buy", Date.now(), PRIMED_TOKEN_ACCOUNT);
 }
 
 
 // Run the script
 main(connection, raydium).catch(console.error);
-// manualSell("3h8XB19dD7aU5ahd1wbypGSP9yHdkKfMHpekk8pnUjVg", "56taN9K7JWz1Uy2wHhf6EwPw8fEoP2LGGw7z87ZrPX2o");
+// manualSell("VGz9T2ZxLBycBzspB5W6CF4u2u3uaPaMxcY5waHmurL", "93faZXiHYYA6VS3j6TyBjw8CtHSawnL4T4MYt9v4DykW");
+// manualBuy("D3HAdi76gqg1LkP1AFsQMeZuSP5UQdnSLXvfu8jMmmdJ", "3iTzw7i1BmCN9gME426yKTHi9eu2sEENNK9LXhFjP1fa");
+
 
 
 

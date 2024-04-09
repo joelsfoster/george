@@ -129,20 +129,27 @@ class RaydiumSwap {
 
     // Precreate tokenAccount only does instructions 1, 2, and 3. (compute, create tokenAccount, initialize tokenAccount)
     // Buy only does instructions 1, 4, and 5. (compute, create memecoin tokenAccount, raydium swap)
-    // Sell only does instruction 1 and 5. (compute, raydium swap)
+    // Sell only does instruction 1 and 5 (which is instruction 4 for a sell because the memecoin tokenAccount already exists). (compute, raydium swap)
     // CloseAccount only does instruction 6. (close account)
-    const computeBudgetInstruction = (command == "buy" || command == "sell") && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(0, 1) : null; // instruction 1
+    // const computeBudgetInstruction = (command == "buy" || command == "sell") && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(0, 1) : null; // instruction 1
+    // const buyRaydiumInstructions = command == "buy" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(3, 5) : null; // instructions 4 and 5
+    // const sellRaydiumInstructions = command == "sell" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(3, 4) : null; // instruction 5
+    // const closeAccountInstructions = command == "closeAccount" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(5, 6) : null; // instruction 6
+    // const createAccountInstructions = command == "precreateAccount" ? swapTransaction.innerTransactions[0].instructions.slice(0, 3) : null; // instructions 1, 2, and 3
+    // const instructionsArray = command == "precreateAccount" ? createAccountInstructions : command == "buy" && primedTokenAccount ? computeBudgetInstruction.concat(buyRaydiumInstructions) : command == "sell" && primedTokenAccount ? computeBudgetInstruction.concat(sellRaydiumInstructions) : command == "closeAccount" && primedTokenAccount ? closeAccountInstructions : swapTransaction.innerTransactions[0].instructions;
+
+    // Trying the above without instruction 1 (compute budget)
     const buyRaydiumInstructions = command == "buy" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(3, 5) : null; // instructions 4 and 5
     const sellRaydiumInstructions = command == "sell" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(3, 4) : null; // instruction 5
     const closeAccountInstructions = command == "closeAccount" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(5, 6) : null; // instruction 6
-    const createAccountInstructions = command == "precreateAccount" ? swapTransaction.innerTransactions[0].instructions.slice(0, 3) : null; // instructions 1, 2, and 3
-    const instructionsArray = command == "precreateAccount" ? createAccountInstructions : command == "buy" && primedTokenAccount ? computeBudgetInstruction.concat(buyRaydiumInstructions) : command == "sell" && primedTokenAccount ? computeBudgetInstruction.concat(sellRaydiumInstructions) : command == "closeAccount" && primedTokenAccount ? closeAccountInstructions : swapTransaction.innerTransactions[0].instructions;
+    const createAccountInstructions = command == "precreateAccount" ? swapTransaction.innerTransactions[0].instructions.slice(1, 3) : null; // instructions 2 and 3
+    const instructionsArray = command == "precreateAccount" ? createAccountInstructions : command == "buy" && primedTokenAccount ? buyRaydiumInstructions : command == "sell" && primedTokenAccount ? sellRaydiumInstructions : command == "closeAccount" && primedTokenAccount ? closeAccountInstructions : swapTransaction.innerTransactions[0].instructions;
 
     if (command == "buy" && primedTokenAccount) {
-      instructionsArray[2].keys[15].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 5 as "Source Account"
+      instructionsArray[1].keys[15].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 5 as "Source Account"
     }
     if (command == "sell" && primedTokenAccount) {
-      instructionsArray[1].keys[16].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 5 as "Destination Account"
+      instructionsArray[0].keys[16].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 5 as "Destination Account"
     }
     if (command == "closeAccount" && primedTokenAccount) {
       instructionsArray[0].keys[0].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 6
@@ -272,7 +279,7 @@ class RaydiumSwap {
     const currencyIn = new Token(TOKEN_PROGRAM_ID, currencyInMint, currencyInDecimals)
     const amountIn = new TokenAmount(currencyIn, rawAmountIn, false)
     const currencyOut = new Token(TOKEN_PROGRAM_ID, currencyOutMint, currencyOutDecimals)
-    const slippage = new Percent(15, 100) // 15% slippage
+    const slippage = new Percent(90, 100) // 90% slippage
 
     const { amountOut, minAmountOut, currentPrice, executionPrice, priceImpact, fee } = Liquidity.computeAmountOut({
       poolKeys,

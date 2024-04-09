@@ -21,7 +21,7 @@ const connection = new Connection(process.env.RPC_URL, {
 // ===== GLOBAL VARIABLES =====
 // ============================
 
-const BUY_PRIORITY_FEE = .00001 * 1000000000; // 0.000008333 // 0.000012173
+const BUY_PRIORITY_FEE = .000015 * 1000000000; // 0.000008333 // 0.000012173 // .0002 - .0025 https://www.quicknode.com/gas-tracker/solana?ref=blog.quicknode.com
 const SELL_PRIORITY_FEE = .00004 * 1000000000; // 0.000008333 // 0.000012173
 
 const MY_WALLET = "HDaBHzbsGnUS8tS9cPRsMZ5wEKWR12gZWsiK5XfgdFYD";
@@ -259,9 +259,9 @@ async function sell(poolInfo, listingTime, primedTokenAccount) {
 
 // Helper function used in swap() whenever a successful trade sequence is finished
 async function success() {
-  const newSolBalance = await checkSolBalance();
-  const solTradeResult = newSolBalance - startingSolBalance;
-  console.log("$$$ TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL $$$");
+  // const newSolBalance = await checkSolBalance();
+  // const solTradeResult = newSolBalance - startingSolBalance;
+  // console.log("$$$ TRADE RESULT: " + newSolBalance + " - " + startingSolBalance + " = " + solTradeResult + " SOL $$$");
   console.log("!!! CONTINUING TRADING... !!!");
   tradeInProgress = false;
 }
@@ -328,6 +328,7 @@ async function closeOldTokenAccounts(poolInfo) {
     const wSolAccounts = accounts.filter(ix => ix.accountInfo.mint === "So11111111111111111111111111111111111111112").sort(function(a, b){return b.accountInfo.tokenAmount.uiAmount-a.accountInfo.tokenAmount.uiAmount});
 
     if (wSolAccounts.length > 1) {
+      console.log("Remaining wSOL tokenAccounts: " + wSolAccounts.length);
       const tokenAccount = new PublicKey(wSolAccounts[1].pubkey);
       const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
       const tx = await raydiumSwap.getSwapTransaction( // Prepare the swap transaction with the given parameters.
@@ -363,6 +364,12 @@ async function swap(poolInfo, buyOrSell, listingTime, primedTokenAccount) {
   let inTokenAmount;
   let inTokenAddress;
   let outTokenAddress;
+  pingCount == 0 && buyOrSell == "buy" ? swapConfig.executeSwap = false : swapConfig.executeSwap = true; // our first transaction is a test ping to see if the pool is launched yet
+  if (pingCount >= 600) {
+    console.log("~~~ GIVING UP AFTER 600 PINGS ~~~");
+    tradeInProgress = false;
+    return;
+  }
   if (buyOrSell == "buy") {
     inTokenAmount = swapConfig.tokenAAmount;
     inTokenAddress = swapConfig.tokenAAddress;
@@ -424,7 +431,6 @@ async function swap(poolInfo, buyOrSell, listingTime, primedTokenAccount) {
         }
         if (error) {
           pingCount++;
-          console.log(error);
           console.log("pingCount: [[[ " + pingCount + " ]]]");
           console.log("~~~ POOL NOT LAUNCHED YET, CONTINUE PINGING... ~~~");
         }
@@ -437,6 +443,9 @@ async function swap(poolInfo, buyOrSell, listingTime, primedTokenAccount) {
 
     // Retry if failed
     if ((buyOrSell == "buy" && swapConfig.tokenBAmount == 0) || (buyOrSell == "sell" && swapConfig.tokenBAmount > 0)) {
+      if (pingCount == 0) {
+        return console.log("~~~ POOL LAUNCHED BEFORE WE COULD FRONTRUN, NOT GOING TO TRADE ~~~");
+      }
       console.log("POOL LAUNCHED, TRANSACTION FAILED, DELAYING AND RETRYING...");
       await setTimeout(async () => {
         await swap(poolInfo, buyOrSell, listingTime, primedTokenAccount);
@@ -457,25 +466,33 @@ async function swap(poolInfo, buyOrSell, listingTime, primedTokenAccount) {
       }
     }
   } else {
-    const tx = await raydiumSwap.getSwapTransaction( // Prepare the swap transaction with the given parameters.
-      outTokenAddress,
-      inTokenAmount,
-      poolInfo,
-      swapConfig.maxLamports,
-      swapConfig.useVersionedTransaction,
-      swapConfig.direction,
-      buyOrSell,
-      primedTokenAccount
-    );
-    const simRes: any = swapConfig.useVersionedTransaction // Simulate the transaction and log the result.
-      ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
-      : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
-    console.log("Swap simulation successful! Details:");
-    console.log(simRes);
-    console.log("PoolOpenTransactionTime: " + listingTime);
-    console.log("TimeNow: " + Date.now());
-    console.log("ExecutionSpeed: " + ((Date.now() - listingTime) / 1000) + " seconds after listing");
-    tradeInProgress = false;
+    try {
+      const tx = await raydiumSwap.getSwapTransaction( // Prepare the swap transaction with the given parameters.
+        outTokenAddress,
+        inTokenAmount,
+        poolInfo,
+        swapConfig.maxLamports,
+        swapConfig.useVersionedTransaction,
+        swapConfig.direction,
+        buyOrSell,
+        primedTokenAccount
+      );
+      const simRes: any = swapConfig.useVersionedTransaction // Simulate the transaction and log the result.
+        ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
+        : await raydiumSwap.simulateLegacyTransaction(tx as Transaction);
+      console.log("BAD: POOL ALREADY OPEN");
+      // console.log("Swap simulation successful! Details:");
+      // console.log(simRes);
+      if (buyOrSell == "sell") {
+        swapConfig.executeSwap = true;
+        await swap(poolInfo, buyOrSell, listingTime, primedTokenAccount);
+      }
+    } catch (error) {
+      console.log("GOOD: POOL NOT OPEN YET");
+      pingCount++;
+      swapConfig.executeSwap = true;
+      await swap(poolInfo, buyOrSell, listingTime, primedTokenAccount);
+    }
   }
 };
 
@@ -579,17 +596,20 @@ async function analyzeAndExecuteTrade(txId, connection) {
             swapConfig.tokenBAddress = tokenBAccount.toBase58();
             swapConfig.tokenBAmount = 0;
             swapConfig.direction = 'in';
-            startingSolBalance = await checkSolBalance();
-            console.log("startingSolBalance: " + startingSolBalance + " SOL");
+            // startingSolBalance = await checkSolBalance();
+            // console.log("startingSolBalance: " + startingSolBalance + " SOL");
             pingCount = 0;
             transactionAttemptCount = 0;
-            closeOldTokenAccounts(poolInfo);
             swap(poolInfo, "buy", listingTime, PRIMED_TOKEN_ACCOUNT);
           }
         } else {
+          const poolInfo = await getPoolData(raydiumIdo, raydiumAuthority);
+          closeOldTokenAccounts(poolInfo);
           return console.log("~~~ NOT SAFE, NOT TRADING... MOVING ON... ~~~");
         }
       } else {
+        const poolInfo = await getPoolData(raydiumIdo, raydiumAuthority);
+        closeOldTokenAccounts(poolInfo);
         return console.log("~~~ NOT DETECTED FAST ENOUGH... MOVING ON... ~~~");
       }
     } else {
@@ -615,7 +635,7 @@ async function manualBuy(ido, mint) {
 
 // Run the script
 main(connection, raydium).catch(console.error);
-// manualSell("VGz9T2ZxLBycBzspB5W6CF4u2u3uaPaMxcY5waHmurL", "93faZXiHYYA6VS3j6TyBjw8CtHSawnL4T4MYt9v4DykW");
+// manualSell("J67d7CA9sd6dzA6igkKnmKwhwXy27H1cgaHv7Y7iApUE", "9PJnp54d8rjSaQ88d3RnyvqyEKCaFddesKDDVBij7g7w");
 // manualBuy("D3HAdi76gqg1LkP1AFsQMeZuSP5UQdnSLXvfu8jMmmdJ", "3iTzw7i1BmCN9gME426yKTHi9eu2sEENNK9LXhFjP1fa");
 
 

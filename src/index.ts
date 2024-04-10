@@ -108,7 +108,7 @@ async function checkWalletBalance(tokenMintAddress) {
 
 
 // Helper function to get pool info
-async function getPoolData(raydiumIdo, raydiumAuthority) {
+async function getPoolData(raydiumIdo, raydiumAuthority, openBookMarketAccount) {
   try {
 
     // First, get liquidity pool info from Raydium
@@ -142,35 +142,18 @@ async function getPoolData(raydiumIdo, raydiumAuthority) {
     const marketResponse = await axios.post(process.env.RPC_URL, {
       jsonrpc: '2.0',
       id: 1,
-      method: 'getProgramAccounts',
+      method: 'getAccountInfo',
       params: [
-        "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX", // OpenBook program ID
+        openBookMarketAccount,
         {
           "encoding": "jsonParsed",
           "commitment": "processed",
-          "filters": [
-            {
-              "dataSize": MARKET_STATE_LAYOUT_V3.span
-            },
-            {
-              "memcmp": {
-                "offset": MARKET_STATE_LAYOUT_V3.offsetOf("baseMint"),
-                "bytes": poolInfo.baseMint.toBase58(),
-              },
-            },
-            {
-              "memcmp": {
-                "offset": MARKET_STATE_LAYOUT_V3.offsetOf("quoteMint"),
-                "bytes": poolInfo.quoteMint.toBase58(),
-              },
-            },
-          ],
         }
       ],
     });
 
     // The response returns a JSON of data in base64. We convert it into a Buffer of Uint8Array for the Raydium library to decode
-    const marketBinaryString = atob(marketResponse.data.result[0].account.data[0]);
+    const marketBinaryString = atob(marketResponse.data.result.value.data[0]);
     const marketUint8Array = Uint8Array.from(marketBinaryString, (char) => char.charCodeAt(0));
     const marketInfo: any = MARKET_STATE_LAYOUT_V3.decode(Buffer.from(marketUint8Array));
     const programId = new PublicKey(poolInfo.marketProgramId.toBase58());
@@ -451,9 +434,11 @@ async function analyzeAndExecuteTrade(txId, connection) {
     const raydiumAuthority = accounts[5];
     const tokenAAccount = accounts[9];
     const tokenBAccount = accounts[8];
+    const openBookMarketAccount = accounts[16];
     const listingTime = tx.blockTime*1000;
     const displayData = [
         { "Token": "IDO", "Account Public Key": raydiumIdo.toBase58() },
+        { "Token": "MarketAccount", "Account Public Key": openBookMarketAccount.toBase58() },
         { "Token": "A", "Account Public Key": tokenAAccount.toBase58() },
         { "Token": "B", "Account Public Key": tokenBAccount.toBase58() }
     ];
@@ -470,7 +455,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
           tradeInProgress = true;
           tradeCount++;
           console.log("TRADECOUNT OF THIS SESSION: " + tradeCount);
-          const poolInfo = await getPoolData(raydiumIdo, raydiumAuthority);
+          const poolInfo = await getPoolData(raydiumIdo, raydiumAuthority, openBookMarketAccount);
           swapConfig.tokenBAddress = tokenBAccount.toBase58();
           swapConfig.tokenBAmount = 0;
           swapConfig.direction = 'in';
@@ -479,7 +464,7 @@ async function analyzeAndExecuteTrade(txId, connection) {
           swap(poolInfo, "buy", listingTime, PRIMED_TOKEN_ACCOUNT);
         }
       } else {
-        const poolInfo = await getPoolData(raydiumIdo, raydiumAuthority);
+        const poolInfo = await getPoolData(raydiumIdo, raydiumAuthority, openBookMarketAccount);
         closeOldTokenAccounts(poolInfo);
         return console.log("~~~ NOT DETECTED FAST ENOUGH... MOVING ON... ~~~");
       }
@@ -490,15 +475,15 @@ async function analyzeAndExecuteTrade(txId, connection) {
 
 
 // Used for force-ending the script and re-running it with uncommented code below
-async function manualSell(ido, mint) {
-    const poolInfo = await getPoolData(new PublicKey(ido), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
+async function manualSell(ido, mint, openBookMarketAccount) {
+    const poolInfo = await getPoolData(new PublicKey(ido), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"), openBookMarketAccount);
     swapConfig.tokenBAddress = mint;
     await refreshBalance();
     await swap(poolInfo, "sell", Date.now(), PRIMED_TOKEN_ACCOUNT);
 }
 
-async function manualBuy(ido, mint) {
-    const poolInfo = await getPoolData(new PublicKey(ido), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
+async function manualBuy(ido, mint, openBookMarketAccount) {
+    const poolInfo = await getPoolData(new PublicKey(ido), new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"), openBookMarketAccount);
     swapConfig.tokenBAddress = mint;
     await swap(poolInfo, "buy", Date.now(), PRIMED_TOKEN_ACCOUNT);
 }

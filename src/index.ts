@@ -21,6 +21,7 @@ const connection = new Connection(process.env.RPC_URL, {
 
 const MY_WALLET = "HDaBHzbsGnUS8tS9cPRsMZ5wEKWR12gZWsiK5XfgdFYD";
 const PRIMED_TOKEN_ACCOUNT = new PublicKey("GLwbCu3z1MS922jSVvbCSwkULUfq6btAphJhc2SeCCc4");
+const PRIORITY_FEE_DEFAULT = .003 * 1000000000;
 
 let swapConfig = {
   executeSwap: true, // Send tx when true, simulate tx when false
@@ -29,12 +30,12 @@ let swapConfig = {
   tokenBAmount: 0,
   tokenAAddress: "So11111111111111111111111111111111111111112", // Token to swap for the other, SOL in this case
   tokenBAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC address
-  maxLamports: .004 * 1000000000 * 8, // Micro lamports for priority fee, .004 = 225000 microLamports for a buy
+  maxLamports: PRIORITY_FEE_DEFAULT,
   direction: "in" as "in" | "out", // Swap direction: 'in' or 'out'
   liquidityFile: "https://api.raydium.io/v2/sdk/liquidity/mainnet.json",
   maxRetries: 20,
   retryFrequency: 1000,
-  sellDelay: 1000,
+  sellDelay: 5000,
 };
 
 let tradeInProgress = false; // prevents concurrent trade sequences, forces 1 token to be traded at a time
@@ -46,6 +47,25 @@ let transactionAttemptCount = 0;
 // ============================
 // ===== HELPER FUNCTIONS =====
 // ============================
+
+// Scrape priority fee in real time from Quicknode's website
+async function getPriorityFee() {
+  try {
+    const response = await axios.get("https://quicknode.com/_gas-tracker?slug=solana", {});
+    const microLamports = Number(Object.values(response.data.sol.per_transaction.percentiles)[2]);
+    if (microLamports) {
+      const myFee = microLamports * 10;
+      swapConfig.maxLamports = myFee;
+      return;
+    } else {
+      throw "WARNING: COULDNT GET UPDATED PRIORITY FEE";
+    }
+  } catch (error) {
+    console.log("WARNING: COULDNT GET UPDATED PRIORITY FEE");
+    swapConfig.maxLamports = PRIORITY_FEE_DEFAULT;
+  }
+}
+
 
 // When first detecting a new listing, we need to have a pre-created tokenAccount ready and funded so that the actual buy transaction goes through faster
 async function precreateTokenAccount(poolInfo, solAmount) {
@@ -289,6 +309,7 @@ async function getAmmInfo(tokenAAccount, tokenBAccount) {
 // Performs a token swap on the Raydium protocol. Depending on the configuration, it can execute the swap or simulate it.
 async function swap(poolInfo, buyOrSell, primedTokenAccount) {
   const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
+  console.log(swapConfig.maxLamports);
   let inTokenAmount;
   let inTokenAddress;
   let outTokenAddress;
@@ -462,8 +483,8 @@ async function analyzeAndExecuteTrade(txId, openBookMarketAccount, detectionTime
           return;
         } else {
           console.log("MEH... DETECTED RIGHT AT CONFIRMATION...");
-          badTrade = true;
-          return;
+          // badTrade = true;
+          // return;
         }
       } else {
         console.log("GOOD: DETECTED BEFORE CONFIRMATION, PROCEEDING...");
@@ -496,6 +517,7 @@ async function analyzeAndExecuteTrade(txId, openBookMarketAccount, detectionTime
         swapConfig.tokenBAddress = tokenBAccount.toBase58();
         pingCount = 0;
         transactionAttemptCount = 0;
+        getPriorityFee();
         swap(poolInfo, "buy", PRIMED_TOKEN_ACCOUNT);
       } else {
         // closeOldTokenAccounts(poolInfo);

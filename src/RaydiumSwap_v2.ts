@@ -99,7 +99,7 @@ class RaydiumSwap {
     useVersionedTransaction = true,
     fixedSide: 'in' | 'out' = 'in',
     command,
-    primedWSolAccount
+    primedTokenAccount,
   ): Promise<Transaction | VersionedTransaction> {
     const directionIn = poolKeys.quoteMint.toString() == toToken
     const { minAmountOut, amountIn } = await this.calcAmountOut(poolKeys, amount, directionIn)
@@ -127,46 +127,28 @@ class RaydiumSwap {
       },
     })
 
-    let computeUnits = 55000;
-    switch(command) {
-      case "buy":
-        computeUnits = 35000;
-        break;
-      case "sell":
-        computeUnits = 35000;
-        break;
-      case "precreateAccount":
-        computeUnits = 27500;
-        break;
-      default:
-        computeUnits = 55000;
-    }
-
-    // 1. compute budget, 2. compute limit (added by us), 3. create wSolAccount, 4. initialize wSolAccount, 5. create tokenAccount, 6. swap, 7. close wSol account
+    // Precreate tokenAccount only does instructions 1, 2, and 3. (compute, create tokenAccount, initialize tokenAccount)
+    // Buy only does instructions 1, 4, and 5. (compute, create memecoin tokenAccount, raydium swap)
+    // Sell only does instruction 1 and 5 (which is instruction 4 for a sell because the memecoin tokenAccount already exists). (compute, raydium swap)
+    // CloseAccount only does instructions 1 and 6. (close account)
+    // We add another instruction "computeLimitInstructions" between 1 and 2
     const computeBudgetInstruction = swapTransaction.innerTransactions[0].instructions.slice(0, 1); // instruction 1
-    const computeLimitInstructions = ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits, }); // creates instruction 2
-    const computeInstructions = computeBudgetInstruction.concat(computeLimitInstructions); // adds instruction 2
+    const computeLimitInstructions = ComputeBudgetProgram.setComputeUnitLimit({ units: 55000, });
+    const computeInstructions = computeBudgetInstruction.concat(computeLimitInstructions);
+    const buyRaydiumInstructions = command == "buy" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(3, 5) : null; // instructions 4 and 5
+    const sellRaydiumInstructions = command == "sell" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(3, 4) : null; // instruction 5
+    const closeAccountInstructions = command == "closeAccount" && primedTokenAccount ? swapTransaction.innerTransactions[0].instructions.slice(5, 6) : null; // instruction 6
+    const createAccountInstructions = command == "precreateAccount" ? swapTransaction.innerTransactions[0].instructions.slice(1, 3) : null; // instructions 2 and 3
+    const instructionsArray = command == "precreateAccount" ? computeInstructions.concat(createAccountInstructions) : command == "buy" && primedTokenAccount ? computeInstructions.concat(buyRaydiumInstructions) : command == "sell" && primedTokenAccount ? computeInstructions.concat(sellRaydiumInstructions) : command == "closeAccount" && primedTokenAccount ? computeInstructions.concat(closeAccountInstructions) : swapTransaction.innerTransactions[0].instructions;
 
-    const completeInstructions = computeInstructions.concat(swapTransaction.innerTransactions[0].instructions.slice(1, 6));
-
-    const seedAccountInstructions = command == "seedAccount" && !primedWSolAccount ? completeInstructions.slice(2, 4) : null; // instructions 3 and 4
-    const precreateAccountInstructions = command == "precreateAccount" && primedWSolAccount ? completeInstructions.slice(4, 5) : null; // instruction 5
-    const buyRaydiumInstructions = command == "buy" && primedWSolAccount ? completeInstructions.slice(4, 5) : null; // instruction 6 (HEADS UP: INSTRUCTION 5 IS DROPPED BECAUSE TOKENACCOUNT IS ALREADY CREATED!)
-    const sellRaydiumInstructions = command == "sell" && primedWSolAccount ? completeInstructions.slice(4, 5) : null; // instruction 6 (HEADS UP: INSTRUCTION 5 IS DROPPED BECAUSE TOKENACCOUNT IS ALREADY CREATED!)
-    const closeAccountInstructions = command == "closeAccount" && primedWSolAccount ? completeInstructions.slice(6, 7) : null; // instruction 7
-    let instructionsArray = command == "seedAccount" ? computeInstructions.concat(seedAccountInstructions) : command == "precreateAccount" ? computeInstructions.concat(precreateAccountInstructions) : command == "buy" && primedWSolAccount ? computeInstructions.concat(buyRaydiumInstructions) : command == "sell" && primedWSolAccount ? computeInstructions.concat(sellRaydiumInstructions) : command == "closeAccount" && primedWSolAccount ? computeInstructions.concat(closeAccountInstructions) : null;
-
-    if (command == "buy" && primedWSolAccount) {
-      instructionsArray[2].keys[15].pubkey = primedWSolAccount; // replace the primedWSolAccount as "Source Account", the precreatedTokenAccount is already looked up
+    if (command == "buy" && primedTokenAccount) {
+      instructionsArray[3].keys[15].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 5 as "Source Account"
     }
-    if (command == "sell" && primedWSolAccount) {
-      instructionsArray[2].keys[16].pubkey = primedWSolAccount; // replace the primedWSolAccount as "Destination Account", the precreatedTokenAccount is already looked up
+    if (command == "sell" && primedTokenAccount) {
+      instructionsArray[2].keys[16].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 5 as "Destination Account"
     }
-    if (command == "closeAccount" && primedWSolAccount) {
-      instructionsArray[2].keys[0].pubkey = primedWSolAccount; // replace the primedWSolAccount in instruction 6
-    }
-    if (command == "precreateAccount" && completeInstructions.length < 7) {
-      instructionsArray = []; // if we try to precreate a tokenAccount when one already exists, instruction 5 is not in the tx and stuff gets messed up, so we empty the array
+    if (command == "closeAccount" && primedTokenAccount) {
+      instructionsArray[2].keys[0].pubkey = primedTokenAccount; // replace the primedTokenAccount in instruction 6
     }
 
     const recentBlockhashForSwap = await this.connection.getLatestBlockhash()

@@ -20,9 +20,8 @@ const connection = new Connection(process.env.RPC_URL, {
 // ============================
 
 const MY_WALLET = "HDaBHzbsGnUS8tS9cPRsMZ5wEKWR12gZWsiK5XfgdFYD";
-const PRIMED_WSOL_ACCOUNT = new PublicKey("GLwbCu3z1MS922jSVvbCSwkULUfq6btAphJhc2SeCCc4");
+const PRIMED_TOKEN_ACCOUNT = new PublicKey("GLwbCu3z1MS922jSVvbCSwkULUfq6btAphJhc2SeCCc4");
 const PRIORITY_FEE_DEFAULT = .003 * 1000000000;
-const PRIORITY_FEE_MULTIPLIER = 20;
 
 let swapConfig = {
   executeSwap: true, // Send tx when true, simulate tx when false
@@ -55,7 +54,7 @@ async function getPriorityFee() {
     const response = await axios.get("https://quicknode.com/_gas-tracker?slug=solana", {});
     const microLamports = Number(Object.values(response.data.sol.per_transaction.percentiles)[2]);
     if (microLamports) {
-      const myFee = microLamports * PRIORITY_FEE_MULTIPLIER;
+      const myFee = microLamports * 10;
       swapConfig.maxLamports = myFee;
       return;
     } else {
@@ -64,6 +63,32 @@ async function getPriorityFee() {
   } catch (error) {
     console.log("WARNING: COULDNT GET UPDATED PRIORITY FEE");
     swapConfig.maxLamports = PRIORITY_FEE_DEFAULT;
+  }
+}
+
+
+// When first detecting a new listing, we need to have a pre-created tokenAccount ready and funded so that the actual buy transaction goes through faster
+async function precreateTokenAccount(poolInfo, solAmount) {
+  try {
+    const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
+    const creationTx = await raydiumSwap.getSwapTransaction(
+      swapConfig.tokenBAddress,
+      solAmount,
+      poolInfo,
+      swapConfig.maxLamports,
+      swapConfig.useVersionedTransaction,
+      swapConfig.direction,
+      "precreateAccount",
+      null
+    );
+    const creationTxId: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
+      ? await raydiumSwap.sendVersionedTransaction(creationTx as VersionedTransaction, swapConfig.maxRetries)
+      : await raydiumSwap.sendLegacyTransaction(creationTx as Transaction, swapConfig.maxRetries);
+    console.log(`PRE-CREATING TOKENACCOUNT: https://solscan.io/tx/${creationTxId}`);
+
+  } catch (error) {
+    console.log(error);
+    return console.log("~~~ ERROR PRE-CREATING TOKENACCOUNT, RETRYING... ~~~");
   }
 }
 
@@ -100,10 +125,10 @@ async function checkWalletBalance(tokenMintAddress) {
 
 
 // Helper function used in swap() to sell a token
-async function sell(poolInfo) {
+async function sell(poolInfo, primedTokenAccount) {
   await refreshBalance();
   console.log("=== SELLING ALL TOKENS NOW, AMOUNT: " + swapConfig.tokenBAddress + " ===");
-  await swap(poolInfo, "sell");
+  await swap(poolInfo, "sell", primedTokenAccount);
 }
 
 
@@ -121,34 +146,8 @@ async function refreshBalance() {
 }
 
 
-// We need a funded wSOL account to make trades
-async function seedWSolAccount(poolInfo, solAmount) {
-  try {
-    const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
-    const creationTx = await raydiumSwap.getSwapTransaction(
-      swapConfig.tokenBAddress,
-      solAmount,
-      poolInfo,
-      swapConfig.maxLamports,
-      swapConfig.useVersionedTransaction,
-      swapConfig.direction,
-      "seedAccount",
-      null
-    );
-    const creationTxId: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
-      ? await raydiumSwap.sendVersionedTransaction(creationTx as VersionedTransaction, swapConfig.maxRetries)
-      : await raydiumSwap.sendLegacyTransaction(creationTx as Transaction, swapConfig.maxRetries);
-    console.log(`SEEDING WSOL ACCOUNT: https://solscan.io/tx/${creationTxId}`);
-
-  } catch (error) {
-    console.log(error);
-    return console.log("~~~ ERROR SEEDING WSOL ACCOUNT, RETRYING... ~~~");
-  }
-}
-
-
 // Close unused tokenAccounts
-async function closeOldWSolAccounts(poolInfo) {
+async function closeOldTokenAccounts(poolInfo) {
   try {
     const walletTokenAccounts = await axios.post(process.env.RPC_URL, {
       jsonrpc: '2.0',
@@ -195,7 +194,7 @@ async function closeOldWSolAccounts(poolInfo) {
     }
   } catch (error) {
     console.log(error);
-    return console.log("~~~ ERROR WITH closeOldWSolAccounts() ~~~");
+    return console.log("~~~ ERROR WITH closeOldTokenAccounts() ~~~");
   }
 }
 
@@ -307,46 +306,8 @@ async function getAmmInfo(tokenAAccount, tokenBAccount) {
 // ==========================
 
 
-// When first detecting a new listing, we need to have a pre-created tokenAccount ready and funded so that the actual buy transaction goes through faster
-async function precreateTokenAccount(poolInfo) {
-  try {
-    const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
-    const creationTx = await raydiumSwap.getSwapTransaction(
-      swapConfig.tokenBAddress,
-      swapConfig.tokenAAmount,
-      poolInfo,
-      swapConfig.maxLamports,
-      swapConfig.useVersionedTransaction,
-      swapConfig.direction,
-      "precreateAccount",
-      PRIMED_WSOL_ACCOUNT
-    );
-
-    const tx: any = creationTx;
-    if (tx.message.compiledInstructions.length < 1) { // will retry until instructionsArray returns empty, meeting the tokenAccount was created successfully
-      console.log("SUCCESS: TOKEN ACCOUNT CREATED, INITIATING BUY");
-      swap(poolInfo, "buy"); // initiates the buy now that the tokenAccount has been created
-    } else {
-      const creationTxId: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
-        ? await raydiumSwap.sendVersionedTransaction(creationTx as VersionedTransaction, swapConfig.maxRetries)
-        : await raydiumSwap.sendLegacyTransaction(creationTx as Transaction, swapConfig.maxRetries);
-      console.log(`PRE-CREATING TOKENACCOUNT: https://solscan.io/tx/${creationTxId}`);
-      return await setTimeout(async () => {
-        await precreateTokenAccount(poolInfo);
-      }, swapConfig.retryFrequency);
-    }
-  } catch (error) {
-    console.log(error);
-    console.log("~~~ ERROR PRE-CREATING TOKENACCOUNT, RETRYING... ~~~");
-    return await setTimeout(async () => {
-      await precreateTokenAccount(poolInfo);
-    }, swapConfig.retryFrequency);
-  }
-}
-
-
 // Performs a token swap on the Raydium protocol. Depending on the configuration, it can execute the swap or simulate it.
-async function swap(poolInfo, buyOrSell) {
+async function swap(poolInfo, buyOrSell, primedTokenAccount) {
   const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
   let inTokenAmount;
   let inTokenAddress;
@@ -381,7 +342,7 @@ async function swap(poolInfo, buyOrSell) {
         swapConfig.useVersionedTransaction,
         swapConfig.direction,
         buyOrSell,
-        PRIMED_WSOL_ACCOUNT
+        primedTokenAccount
       );
       const txid: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
         ? await raydiumSwap.sendVersionedTransaction(tx as VersionedTransaction, swapConfig.maxRetries)
@@ -407,7 +368,7 @@ async function swap(poolInfo, buyOrSell) {
           console.log("BUY SUCCESSFUL, WAITING THEN SELLING...");
           return await setTimeout(async () => {
             transactionAttemptCount = 0;
-            await sell(poolInfo);
+            await sell(poolInfo, primedTokenAccount);
           }, swapConfig.sellDelay);
         }
         if (error) {
@@ -416,7 +377,7 @@ async function swap(poolInfo, buyOrSell) {
           console.log("pingCount: [[[ " + pingCount + " ]]]");
           console.log("~~~ POOL NOT LAUNCHED YET, CONTINUE PINGING... ~~~");
           return await setTimeout(async () => {
-            await swap(poolInfo, buyOrSell);
+            await swap(poolInfo, buyOrSell, primedTokenAccount);
           }, swapConfig.retryFrequency);
         }
       }
@@ -430,7 +391,7 @@ async function swap(poolInfo, buyOrSell) {
     if ((buyOrSell == "buy" && swapConfig.tokenBAmount == 0) || (buyOrSell == "sell" && swapConfig.tokenBAmount > 0)) {
       console.log("POOL LAUNCHED, TRANSACTION FAILED, DELAYING AND RETRYING...");
       await setTimeout(async () => {
-        await swap(poolInfo, buyOrSell);
+        await swap(poolInfo, buyOrSell, primedTokenAccount);
       }, swapConfig.retryFrequency);
     } else {
 
@@ -439,7 +400,7 @@ async function swap(poolInfo, buyOrSell) {
         console.log("!!! BUY SUCCESSFUL, WAITING THEN SELLING... !!!");
         await setTimeout(async () => {
           transactionAttemptCount = 0;
-          await sell(poolInfo);
+          await sell(poolInfo, primedTokenAccount);
         }, swapConfig.sellDelay);
       } else { // Sell successful! Log SOL amount and continue trading
         console.log("SELL SUCCESSFUL");
@@ -456,7 +417,7 @@ async function swap(poolInfo, buyOrSell) {
         swapConfig.useVersionedTransaction,
         swapConfig.direction,
         buyOrSell,
-        PRIMED_WSOL_ACCOUNT
+        primedTokenAccount
       );
       const simRes: any = swapConfig.useVersionedTransaction
         ? await raydiumSwap.simulateVersionedTransaction(tx as VersionedTransaction)
@@ -530,7 +491,7 @@ async function analyzeAndExecuteTrade(txId, openBookMarketAccount, detectionTime
     });
 
   const poolInfo = await getPoolInfo(openBookMarketAccount);
-  if (!poolInfo) { return }; // if poolInfo is not found fast enough, move on to next listing
+  if (!poolInfo) { return console.log("COULD NOT GET POOL INFO FAST ENOUGH, MOVING ON...") };
   const tokenAAccount = poolInfo.quoteMint;
   const tokenBAccount = poolInfo.baseMint;
 
@@ -556,9 +517,9 @@ async function analyzeAndExecuteTrade(txId, openBookMarketAccount, detectionTime
         pingCount = 0;
         transactionAttemptCount = 0;
         getPriorityFee();
-        precreateTokenAccount(poolInfo); // this starts the swap process
+        swap(poolInfo, "buy", PRIMED_TOKEN_ACCOUNT);
       } else {
-        // closeOldWSolAccounts(poolInfo);
+        // closeOldTokenAccounts(poolInfo);
         return console.log("~~~ BAD: DETECTED AFTER CONFIRMATION, MOVING ON... ~~~");;
       }
     }
@@ -573,10 +534,17 @@ async function manualSell(openBookMarketAccount) {
   const poolInfo = await getPoolInfo(openBookMarketAccount);
   swapConfig.tokenBAddress = poolInfo.baseMint;
   await refreshBalance();
-  await swap(poolInfo, "sell"); // a tokenAccount already exists so its safe to call this
+  await swap(poolInfo, "sell", PRIMED_TOKEN_ACCOUNT);
+}
+
+async function manualBuy(openBookMarketAccount) {
+  const poolInfo = await getPoolInfo(openBookMarketAccount);
+  swapConfig.tokenBAddress = poolInfo.baseMint;
+  await swap(poolInfo, "buy", PRIMED_TOKEN_ACCOUNT);
 }
 
 
 // Run the script
 main(connection, raydium).catch(console.error);
 // manualSell("4LxVvm1zdp1FhhHLrgUYvjbVNPtLcBc8hbrHK7xwkvBa");
+// manualBuy("4LxVvm1zdp1FhhHLrgUYvjbVNPtLcBc8hbrHK7xwkvBa");

@@ -1,10 +1,17 @@
 import 'dotenv/config';
 import RaydiumSwap from './RaydiumSwap';
-import { Transaction, VersionedTransaction, Connection, PublicKey } from "@solana/web3.js";
+import { Transaction, VersionedTransaction, Connection, PublicKey, Signer, TransactionMessage, TransactionInstruction, Keypair } from "@solana/web3.js";
 import axios from 'axios';
 import { LIQUIDITY_STATE_LAYOUT_V4, MARKET_STATE_LAYOUT_V3, Market, TOKEN_PROGRAM_ID } from "@raydium-io/raydium-sdk";
 import bs58 from 'bs58';
 import base64 from 'base64-js';
+import {
+  ACCOUNT_SIZE,
+  createAssociatedTokenAccountInstruction,
+  createInitializeAccountInstruction,
+  getAssociatedTokenAddress,
+  getMinimumBalanceForRentExemptAccount,
+} from "@solana/spl-token";
 
 const SESSION_HASH = 'QNDEMO' + Math.ceil(Math.random() * 1e9); // Random unique identifier for your session
 const RAYDIUM_PUBLIC_KEY = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -22,12 +29,12 @@ const connection = new Connection(process.env.RPC_URL, {
 const MY_WALLET = "HDaBHzbsGnUS8tS9cPRsMZ5wEKWR12gZWsiK5XfgdFYD";
 const PRIMED_WSOL_ACCOUNT = new PublicKey("GLwbCu3z1MS922jSVvbCSwkULUfq6btAphJhc2SeCCc4");
 const PRIORITY_FEE_DEFAULT = .003 * 1000000000;
-const PRIORITY_FEE_MULTIPLIER = 20;
+const PRIORITY_FEE_MULTIPLIER = 30;
 
 let swapConfig = {
   executeSwap: true, // Send tx when true, simulate tx when false
   useVersionedTransaction: true,
-  tokenAAmount: 0.0001, // Swap 0.1 SOL for USDC in this example
+  tokenAAmount: 0.001, // Swap 0.1 SOL for USDC in this example
   tokenBAmount: 0,
   tokenAAddress: "So11111111111111111111111111111111111111112", // Token to swap for the other, SOL in this case
   tokenBAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC address
@@ -36,13 +43,14 @@ let swapConfig = {
   liquidityFile: "https://api.raydium.io/v2/sdk/liquidity/mainnet.json",
   maxRetries: 20,
   retryFrequency: 1000,
-  sellDelay: 5000,
+  sellDelay: 10000,
 };
 
 let tradeInProgress = false; // prevents concurrent trade sequences, forces 1 token to be traded at a time
 let tradeCount = 0;
 let pingCount = 0;
 let transactionAttemptCount = 0;
+let getPoolInfoAttempts = 0;
 
 
 // ============================
@@ -57,6 +65,8 @@ async function getPriorityFee() {
     if (microLamports) {
       const myFee = microLamports * PRIORITY_FEE_MULTIPLIER;
       swapConfig.maxLamports = myFee;
+      console.log("RECOMMENDED FEES: " + microLamports);
+      console.log("MY FEES: " + myFee);
       return;
     } else {
       throw "WARNING: COULDNT GET UPDATED PRIORITY FEE";
@@ -92,7 +102,6 @@ async function checkWalletBalance(tokenMintAddress) {
     } else {
       return 0;
     }
-
   } catch (error) {
     throw new Error(`checkWalletBalance Error: ${error}`);
   }
@@ -102,7 +111,7 @@ async function checkWalletBalance(tokenMintAddress) {
 // Helper function used in swap() to sell a token
 async function sell(poolInfo) {
   await refreshBalance();
-  console.log("=== SELLING ALL TOKENS NOW, AMOUNT: " + swapConfig.tokenBAddress + " ===");
+  console.log("=== SELLING ALL TOKENS NOW ===");
   await swap(poolInfo, "sell");
 }
 
@@ -139,7 +148,6 @@ async function seedWSolAccount(poolInfo, solAmount) {
       ? await raydiumSwap.sendVersionedTransaction(creationTx as VersionedTransaction, swapConfig.maxRetries)
       : await raydiumSwap.sendLegacyTransaction(creationTx as Transaction, swapConfig.maxRetries);
     console.log(`SEEDING WSOL ACCOUNT: https://solscan.io/tx/${creationTxId}`);
-
   } catch (error) {
     console.log(error);
     return console.log("~~~ ERROR SEEDING WSOL ACCOUNT, RETRYING... ~~~");
@@ -173,7 +181,6 @@ async function closeOldWSolAccounts(poolInfo) {
     }))
 
     const wSolAccounts = accounts.filter(ix => ix.accountInfo.mint === "So11111111111111111111111111111111111111112").sort(function(a, b){return b.accountInfo.tokenAmount.uiAmount-a.accountInfo.tokenAmount.uiAmount});
-
     if (wSolAccounts.length > 1) {
       console.log("Remaining wSOL tokenAccounts: " + wSolAccounts.length);
       const tokenAccount = new PublicKey(wSolAccounts[1].pubkey);
@@ -201,59 +208,66 @@ async function closeOldWSolAccounts(poolInfo) {
 
 
 // Main function to get all necessary data
-async function getPoolInfo(openBookMarketAccount) {
+async function getPoolInfo(tokenAAccount, tokenBAccount) {
   try {
-    const marketResponse = await axios.post(process.env.RPC_URL, { // Get openBook market data
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getAccountInfo',
-      params: [
-        openBookMarketAccount,
-        {
-          "encoding": "jsonParsed",
-          "commitment": "processed",
-        }
-      ],
-    });
-
-    // The response returns a JSON of data in base64. We convert it into a Buffer of Uint8Array for the Raydium library to decode
-    const marketBinaryString = atob(marketResponse.data.result.value.data[0]);
-    const marketUint8Array = Uint8Array.from(marketBinaryString, (char) => char.charCodeAt(0));
-    const marketInfo: any = MARKET_STATE_LAYOUT_V3.decode(Buffer.from(marketUint8Array));
-
-    // Stiching together the poolInfo
-    const tokenAAccount = marketInfo.quoteMint;
-    const tokenBAccount = marketInfo.baseMint;
     const poolInfo = await getAmmInfo(tokenAAccount, tokenBAccount);
-    if (!poolInfo) { return console.log("COULD NOT GET POOL INFO FAST ENOUGH, MOVING ON...") };
-    const programId = new PublicKey(poolInfo.marketProgramId.toBase58());
-    const marketId = new PublicKey(poolInfo.marketId.toBase58());
-    poolInfo.marketAuthority = Market.getAssociatedAuthority({ programId, marketId }).publicKey;
-    poolInfo.marketBaseVault = marketInfo.baseVault;
-    poolInfo.marketQuoteVault = marketInfo.quoteVault;
-    poolInfo.marketBids = marketInfo.bids;
-    poolInfo.marketAsks = marketInfo.asks;
-    poolInfo.marketEventQueue = marketInfo.eventQueue;
-    poolInfo.programId = new PublicKey(RAYDIUM_PUBLIC_KEY);
-    poolInfo.authority = new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1");
-    poolInfo.baseDecimals = poolInfo.baseDecimal.toNumber();
-    poolInfo.quoteDecimals = poolInfo.quoteDecimal.toNumber();
-    poolInfo.version = 4; // MIGHT BREAK?!?
-    poolInfo.marketVersion = 4; // MIGHT BREAK?!?
 
-    if (poolInfo.id) {
+    if (poolInfo) {
+      const programId = new PublicKey(poolInfo.marketProgramId.toBase58());
+      const marketId = new PublicKey(poolInfo.marketId.toBase58());
+
+      const marketResponse = await axios.post(process.env.RPC_URL, { // Get openBook market data
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getAccountInfo',
+        params: [
+          marketId,
+          {
+            "encoding": "jsonParsed",
+            "commitment": "processed",
+          }
+        ],
+      });
+
+      // The response returns a JSON of data in base64. We convert it into a Buffer of Uint8Array for the Raydium library to decode
+      const marketBinaryString = atob(marketResponse.data.result.value.data[0]);
+      const marketUint8Array = Uint8Array.from(marketBinaryString, (char) => char.charCodeAt(0));
+      const marketInfo: any = MARKET_STATE_LAYOUT_V3.decode(Buffer.from(marketUint8Array));
+
+      // Stiching together the poolInfo
+      poolInfo.marketAuthority = Market.getAssociatedAuthority({ programId, marketId }).publicKey;
+      poolInfo.marketBaseVault = marketInfo.baseVault;
+      poolInfo.marketQuoteVault = marketInfo.quoteVault;
+      poolInfo.marketBids = marketInfo.bids;
+      poolInfo.marketAsks = marketInfo.asks;
+      poolInfo.marketEventQueue = marketInfo.eventQueue;
+      poolInfo.programId = new PublicKey(RAYDIUM_PUBLIC_KEY);
+      poolInfo.authority = new PublicKey("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1");
+      poolInfo.baseDecimals = poolInfo.baseDecimal.toNumber();
+      poolInfo.quoteDecimals = poolInfo.quoteDecimal.toNumber();
+      poolInfo.version = 4; // MIGHT BREAK?!?
+      poolInfo.marketVersion = 4; // MIGHT BREAK?!?
+
       return poolInfo;
     } else {
-      return null;
+      if (getPoolInfoAttempts > 600) {
+        console.log("GIVING UP ON GETTING POOL INFO");
+        return null;
+      }
+      console.log("Failed to get pool info, retrying... getPoolInfoAttempts: " + getPoolInfoAttempts);
+      getPoolInfoAttempts++;
+      await new Promise(r => setTimeout(r, swapConfig.retryFrequency));
+      return await getPoolInfo(tokenAAccount, tokenBAccount);
     }
   } catch (error) {
     console.log("~~~ ERROR WITH getPoolInfo() ~~~");
+    console.log(error);
     return null;
   }
 }
 
 
-// Get the Raydium AMM ID
+// Get the Raydium AMM liquidity pool info, used in getPoolInfo()
 async function getAmmInfo(tokenAAccount, tokenBAccount) {
   try {
     const response = await axios.post(process.env.RPC_URL, {
@@ -302,45 +316,177 @@ async function getAmmInfo(tokenAAccount, tokenBAccount) {
 }
 
 
+// Used for manual transactions
+async function getLatestBlockhash() {
+  try {
+    const response = await axios.post(process.env.RPC_URL, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getLatestBlockhash',
+      params: [
+        {
+          "commitment": "finalized",
+        }
+      ],
+    });
+
+    return response.data.result.value;
+  } catch (error) {
+    return console.log("~~~ ERROR WITH getLatestBlockhash() ~~~");
+  }
+}
+
+
+// For precreating the tokenAccount
+async function sendAtaTransaction(myAta, tokenBAccount) {
+  try {
+    let tx = new VersionedTransaction(
+      new TransactionMessage({
+        payerKey: new PublicKey(MY_WALLET),
+        recentBlockhash: await getLatestBlockhash().then((res => res.blockhash)),
+        instructions: [
+          await createAssociatedTokenAccountInstruction(
+            new PublicKey(MY_WALLET), // payer
+            myAta, // ata
+            new PublicKey(MY_WALLET), // owner
+            tokenBAccount // mint
+          )
+        ],
+      }).compileToV0Message()
+    );
+    tx.sign([Keypair.fromSecretKey(Uint8Array.from(bs58.decode(process.env.WALLET_PRIVATE_KEY)))]);
+
+    const serializedTx = tx.serialize();
+    const serializedTxBase58 = bs58.encode(serializedTx);
+    const ataTxRes = await axios.post(process.env.RPC_URL, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'sendTransaction',
+      params: [serializedTxBase58],
+    });
+    const ataTx = ataTxRes.data.result;
+    console.log(`PRE-CREATING TOKENACCOUNT: https://solscan.io/tx/${ataTx}`);
+
+    // Check my token accounts to see if this ATA exists and retry if failed
+    const response = await axios.post(process.env.RPC_URL, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTokenAccountsByOwner',
+      params: [
+        new PublicKey(MY_WALLET),
+        {
+          "mint": tokenBAccount,
+        },
+        {
+          "encoding": "jsonParsed",
+          "commitment": "processed",
+        },
+      ],
+    });
+
+    if (response.data.result.value.length > 0) {
+      console.log("WOOHOO! ATA CREATED SUCCESSFULLY!");
+      return true;
+    } else {
+      await new Promise(r => setTimeout(r, swapConfig.retryFrequency));
+      return await sendAtaTransaction(myAta, tokenBAccount);
+    }
+  } catch (error) {
+    console.log(error);
+    console.log("~~~ ERROR WITH sendAtaTransaction() ~~~");
+    return false;
+  }
+}
+
+
 // ==========================
 // ===== MAIN APP LOGIC =====
 // ==========================
 
+// Monitor OpenBook logs and proceed if new market found
+async function main(connection) {
+  console.log("Monitoring logs for program: srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX");
+  connection.onLogs(
+    new PublicKey ("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX"),
+    ({ logs, err, signature }) => {
+      if (err) return;
+      if (logs && logs.some(log => log.includes("Transfer"))) {
+        // nothing
+      } else {
+        if (
+          !tradeInProgress &&
+          logs.length > 3 &&
+          logs[logs.length - 4].substring(0,40) == "Program 11111111111111111111111111111111" &&
+          logs[logs.length - 3].substring(0,51) == "Program srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX" &&
+          logs[logs.length - 2].substring(0,51) == "Program srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX" &&
+          logs[logs.length - 1].substring(0,51) == "Program srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX"
+        ) {
+          console.log("NEW OPENBOOK MARKET DETECTED:");
+          console.log("https://solscan.io/tx/" + signature);
+          precreateTokenAccount(connection, signature);
+        }
+      }
+    },
+    "confirmed"
+  );
+}
+
 
 // When first detecting a new listing, we need to have a pre-created tokenAccount ready and funded so that the actual buy transaction goes through faster
-async function precreateTokenAccount(poolInfo) {
+async function precreateTokenAccount(connection, signature) {
   try {
-    const raydiumSwap = new RaydiumSwap(process.env.RPC_URL, process.env.WALLET_PRIVATE_KEY);
-    const creationTx = await raydiumSwap.getSwapTransaction(
-      swapConfig.tokenBAddress,
-      swapConfig.tokenAAmount,
-      poolInfo,
-      swapConfig.maxLamports,
-      swapConfig.useVersionedTransaction,
-      swapConfig.direction,
-      "precreateAccount",
-      PRIMED_WSOL_ACCOUNT
-    );
+    const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+    let accountsObject = null;
+    try {
+      accountsObject = tx?.transaction.message.instructions.find(ix => ix.programId.toBase58() === "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX");
+    } catch (error) {
+      return console.log("No accounts found in the transaction: https://solscan.io/tx/" + signature);
+    }
+    if (!accountsObject) { return console.log("No accounts found in the transaction: https://solscan.io/tx/" + signature); }
+    const accounts = accountsObject.accounts;
+    const tokenAAccount = accounts[8];
+    const tokenBAccount = accounts[7];
 
-    const tx: any = creationTx;
-    if (tx.message.compiledInstructions.length < 1) { // will retry until instructionsArray returns empty, meeting the tokenAccount was created successfully
-      console.log("SUCCESS: TOKEN ACCOUNT CREATED, INITIATING BUY");
-      swap(poolInfo, "buy"); // initiates the buy now that the tokenAccount has been created
+    // Continue if a SOL pair... FOR SIMPLICITY'S SAKE, ONLY TRADING PAIRS WHERE SOL IS THE TOKEN-A
+    if (accounts.length == 10 && tokenAAccount.toBase58() == "So11111111111111111111111111111111111111112") {
+      const myAta = await getAssociatedTokenAddress(
+        tokenBAccount, // mint
+        new PublicKey(MY_WALLET), // owner
+        false // allow owner off curve
+      );
+
+      // Log everything
+      const displayData = [
+          { "Token": "A", "Account Public Key": tokenAAccount.toBase58() },
+          { "Token": "B", "Account Public Key": tokenBAccount.toBase58() },
+          { "Token": "My ATA", "Account Public Key": myAta.toBase58() }
+      ];
+      console.table(displayData);
+
+      // Set state
+      tradeInProgress = true;
+      getPoolInfoAttempts = 0;
+      swapConfig.tokenBAddress = tokenBAccount.toBase58();
+
+      // Create an ATA and get pool info, wait for both of these to finish successfully, then swap
+      const [poolInfo, ataSuccessfullyCreated] = await Promise.all([getPoolInfo(tokenAAccount, tokenBAccount), sendAtaTransaction(myAta, tokenBAccount)]);
+      if (poolInfo && ataSuccessfullyCreated) {
+        tradeCount++;
+        console.log("TRADECOUNT OF THIS SESSION: " + tradeCount);
+        pingCount = 0;
+        transactionAttemptCount = 0;
+        getPriorityFee();
+        await swap(poolInfo, "buy");
+      } else {
+        console.log("SOMETHING WENT WRONG WITH ATA CREATION / GETTING POOL INFO");
+        return tradeInProgress = false;
+      }
     } else {
-      const creationTxId: any = swapConfig.useVersionedTransaction // Send the transaction to the network and log the transaction ID.
-        ? await raydiumSwap.sendVersionedTransaction(creationTx as VersionedTransaction, swapConfig.maxRetries)
-        : await raydiumSwap.sendLegacyTransaction(creationTx as Transaction, swapConfig.maxRetries);
-      console.log(`PRE-CREATING TOKENACCOUNT: https://solscan.io/tx/${creationTxId}`);
-      return await setTimeout(async () => {
-        await precreateTokenAccount(poolInfo);
-      }, swapConfig.retryFrequency);
+      return console.log("~~~ NOT A SOL PAIR... MOVING ON... ~~~");
     }
   } catch (error) {
     console.log(error);
-    console.log("~~~ ERROR PRE-CREATING TOKENACCOUNT, RETRYING... ~~~");
-    return await setTimeout(async () => {
-      await precreateTokenAccount(poolInfo);
-    }, swapConfig.retryFrequency);
+    return console.log("~~~ ERROR WITH precreateTokenAccount() ~~~");
   }
 }
 
@@ -471,112 +617,16 @@ async function swap(poolInfo, buyOrSell) {
 };
 
 
-// Monitor Raydium logs and proceed if new LP found
-async function main(connection, programAddress) {
-  console.log("Monitoring logs for program:", programAddress.toString());
-  connection.onLogs(
-    programAddress,
-    ({ logs, err, signature }) => {
-      if (err) return;
-
-      if (!tradeInProgress && logs && logs.some(log => log.includes("initialize2"))) {
-        console.log("=== New LP Found ===");
-        console.log("https://solscan.io/tx/" + signature);
-        const detectionTime = Date.now();
-        console.log("Detection time: " + detectionTime);
-
-        const rayLogString = logs.find((arrayString) => arrayString.includes("ray_log"));
-        const encodedOpenBookMarketAccount = rayLogString.split(" ")[3];
-        const openBookMarketAccount = new PublicKey(decodeInitLog(base64.toByteArray(encodedOpenBookMarketAccount)));
-
-        function decodeInitLog(bytes) {
-          const logType = bytes[0];
-          if (logType !== 0) { throw new Error("Incorrect LogType"); }
-          bytes = bytes.slice(1);
-          const log = { market: bs58.encode(Buffer.from(bytes.slice(42), 'hex')) };
-          return log.market;
-        }
-
-        analyzeAndExecuteTrade(signature, openBookMarketAccount, detectionTime);
-      }
-    },
-    "processed"
-  );
-}
-
-
-// Parse transaction and filter data
-async function analyzeAndExecuteTrade(txId, openBookMarketAccount, detectionTime) {
-
-  let badTrade = false;
-
-  // Only trade if pool detected within 5 seconds
-  connection.getParsedTransaction(txId, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' })
-    .then( (result) => {
-      if (result) {
-        const reactionTime = (detectionTime - result.blockTime*1000) / 1000;
-        console.log("PoolOpenTransactionTime: " + result.blockTime*1000 + " | " + reactionTime + " seconds late");
-        if (reactionTime > 5) {
-          badTrade = true;
-          return;
-        } else {
-          console.log("MEH... DETECTED RIGHT AT CONFIRMATION...");
-          // badTrade = true;
-          // return;
-        }
-      } else {
-        console.log("GOOD: DETECTED BEFORE CONFIRMATION, PROCEEDING...");
-      }
-    });
-
-  const poolInfo = await getPoolInfo(openBookMarketAccount);
-  if (!poolInfo) { return }; // if poolInfo is not found fast enough, move on to next listing
-  const tokenAAccount = poolInfo.quoteMint;
-  const tokenBAccount = poolInfo.baseMint;
-
-  // Log everything
-  const displayData = [
-      { "Token": "IDO", "Account Public Key": poolInfo.id.toBase58() },
-      { "Token": "MarketAccount", "Account Public Key": openBookMarketAccount.toBase58() },
-      { "Token": "A", "Account Public Key": tokenAAccount.toBase58() },
-      { "Token": "B", "Account Public Key": tokenBAccount.toBase58() }
-  ];
-  console.table(displayData);
-
-  // Continue if a SOL pair... FOR SIMPLICITY'S SAKE, ONLY TRADING PAIRS WHERE SOL IS THE TOKEN-A
-  if (tokenAAccount == "So11111111111111111111111111111111111111112") {
-    if (!tradeInProgress) {
-      const executionTime = (Date.now() - detectionTime) / 1000;
-      console.log("ExecutionTime: " + executionTime + " seconds");
-      if (!badTrade) {
-        tradeInProgress = true;
-        tradeCount++;
-        console.log("TRADECOUNT OF THIS SESSION: " + tradeCount);
-        swapConfig.tokenBAddress = tokenBAccount.toBase58();
-        pingCount = 0;
-        transactionAttemptCount = 0;
-        getPriorityFee();
-        precreateTokenAccount(poolInfo); // this starts the swap process
-      } else {
-        // closeOldWSolAccounts(poolInfo);
-        return console.log("~~~ BAD: DETECTED AFTER CONFIRMATION, MOVING ON... ~~~");;
-      }
-    }
-  } else {
-    return console.log("~~~ NOT A SOL PAIR... MOVING ON... ~~~");
-  }
-}
-
-
 // Used for force-ending the script and re-running it with uncommented code below
-async function manualSell(openBookMarketAccount) {
-  const poolInfo = await getPoolInfo(openBookMarketAccount);
-  swapConfig.tokenBAddress = poolInfo.baseMint;
+async function manualSell(tokenBAccount) {
+  const tokenAAccount = new PublicKey("So11111111111111111111111111111111111111112");
+  const poolInfo = await getPoolInfo(tokenAAccount, tokenBAccount);
+  swapConfig.tokenBAddress = tokenBAccount.toBase58();
   await refreshBalance();
   await swap(poolInfo, "sell"); // a tokenAccount already exists so its safe to call this
 }
 
 
 // Run the script
-main(connection, raydium).catch(console.error);
-// manualSell("4LxVvm1zdp1FhhHLrgUYvjbVNPtLcBc8hbrHK7xwkvBa");
+main(connection).catch(console.error);
+// manualSell(new PublicKey("BoNKvoUSQoR24bCJkgw7NjHJgFyVKhKzLbRpD529LP3L"));

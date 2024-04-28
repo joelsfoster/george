@@ -153,7 +153,7 @@ class RaydiumSwap {
     const precreateAccountInstructions = command == "precreateAccount" && primedWSolAccount ? completeInstructions.slice(4, 5) : null; // instruction 5
     const buyRaydiumInstructions = command == "buy" && primedWSolAccount ? completeInstructions.slice(4, 5) : null; // instruction 6 (HEADS UP: INSTRUCTION 5 IS DROPPED BECAUSE TOKENACCOUNT IS ALREADY CREATED!)
     const sellRaydiumInstructions = command == "sell" && primedWSolAccount ? completeInstructions.slice(4, 5) : null; // instruction 6 (HEADS UP: INSTRUCTION 5 IS DROPPED BECAUSE TOKENACCOUNT IS ALREADY CREATED!)
-    const closeAccountInstructions = command == "closeAccount" && primedWSolAccount ? completeInstructions.slice(5, 6) : null; // instruction 7 (HEADS UP: INSTRUCTION 5 IS DROPPED BECAUSE TOKENACCOUNT IS ALREADY CREATED!)
+    const closeAccountInstructions = command == "closeAccount" && primedWSolAccount ? completeInstructions.slice(6, 7) : null; // instruction 7
     let instructionsArray = command == "seedAccount" ? computeInstructions.concat(seedAccountInstructions) : command == "precreateAccount" ? computeInstructions.concat(precreateAccountInstructions) : command == "buy" && primedWSolAccount ? computeInstructions.concat(buyRaydiumInstructions) : command == "sell" && primedWSolAccount ? computeInstructions.concat(sellRaydiumInstructions) : command == "closeAccount" && primedWSolAccount ? computeInstructions.concat(closeAccountInstructions) : null;
 
     if (command == "buy" && primedWSolAccount) {
@@ -163,9 +163,7 @@ class RaydiumSwap {
       instructionsArray[2].keys[16].pubkey = primedWSolAccount; // replace the primedWSolAccount as "Destination Account", the precreatedTokenAccount is already looked up
     }
     if (command == "closeAccount" && primedWSolAccount) {
-      instructionsArray[2].keys[0].pubkey = primedWSolAccount; // replace the tokenAccount in instruction 7
-      instructionsArray.shift();
-      instructionsArray.shift();
+      instructionsArray[2].keys[0].pubkey = primedWSolAccount; // replace the primedWSolAccount in instruction 6
     }
     if (command == "precreateAccount" && completeInstructions.length < 7) {
       instructionsArray = []; // if we try to precreate a tokenAccount when one already exists, instruction 5 is not in the tx and stuff gets messed up, so we empty the array
